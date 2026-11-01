@@ -72,6 +72,9 @@ AS_EXCLUDES="$EXCLUDES_DIR/excludes-as.txt"
 COUNTRY_EXCLUDES="$EXCLUDES_DIR/excludes-country.txt"
 FORCE_INCLUDES="$EXCLUDES_DIR/includes-force.txt"
 
+# Таблицы policy routing — должны совпадать с клиентом (он пишет их в state).
+POLICY_TABLE_DIRECT="${POLICY_TABLE_DIRECT:-200}"
+
 log(){ echo "[$(date -Is)] $*"; }
 die(){ echo "[ERROR] $*" >&2; exit 1; }
 
@@ -222,9 +225,10 @@ load_exclude_set() {
 }
 
 # Массовое runtime-применение direct-изменений одним netlink-батчем.
-# stdin: строки "add CIDR" / "del CIDR". del пропускается, если CIDR ещё
-# встречается в другом файле исключений. Без работающего туннеля — только
-# запись в файл (подхватится при следующем 'up').
+# stdin: строки "add CIDR" / "del CIDR". Маршруты живут в таблице
+# POLICY_TABLE_DIRECT (там — вся политика, main не трогается). del
+# пропускается, если CIDR ещё встречается в другом exclude-файле.
+# Без работающего туннеля — только запись в файл (подхватится при 'up').
 apply_direct_changes() {
   local ops=() line=""
   while IFS= read -r line; do
@@ -236,6 +240,9 @@ apply_direct_changes() {
     log "Туннель не работает — маршруты подхватятся при следующем 'up'"
     return 0
   fi
+
+  local table
+  table="$(policy_table_direct_runtime)"
 
   local default_route gw dev
   default_route="$(ip -4 route show default | head -n1 || true)"
@@ -260,16 +267,16 @@ apply_direct_changes() {
         add)
           has_add=1
           if [[ -n "$gw" ]]; then
-            printf 'route replace %s via %s dev %s\n' "$cidr" "$gw" "$dev"
+            printf 'route replace %s via %s dev %s table %s\n' "$cidr" "$gw" "$dev" "$table"
           else
-            printf 'route replace %s dev %s\n' "$cidr" "$dev"
+            printf 'route replace %s dev %s table %s\n' "$cidr" "$dev" "$table"
           fi
           ;;
         del)
           if [[ -n "${excl[$cidr]:-}" ]]; then
             log "Маршрут оставлен (CIDR есть в другом exclude-файле): $cidr"
           else
-            printf 'route del %s\n' "$cidr"
+            printf 'route del %s table %s\n' "$cidr" "$table"
           fi
           ;;
         *) die "Внутренняя ошибка: bad op '$op'" ;;
@@ -302,11 +309,12 @@ apply_force_changes() {
     return 0
   fi
 
-  local rt tdev tip
-  rt="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s %s" "${TUN_DEV:-}" "${SERVER_TUN_IP:-}"' 2>/dev/null || true)"
+  local rt tdev tip table
+  rt="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s %s %s" "${TUN_DEV:-}" "${SERVER_TUN_IP:-}" "${POLICY_TABLE_DIRECT:-200}"' 2>/dev/null || true)"
   tdev="${rt%% *}"
-  tip="${rt##* }"
-  if [[ -z "$tdev" || -z "$tip" ]]; then
+  tip="$(awk '{print $2}' <<<"$rt")"
+  table="$(awk '{print $3}' <<<"$rt")"
+  if [[ -z "$tdev" || -z "$tip" || -z "$table" ]]; then
     log "Не прочитано состояние туннеля — маршруты подхватятся при следующем 'up'"
     return 0
   fi
@@ -318,8 +326,8 @@ apply_force_changes() {
       op="${line%% *}"
       cidr="${line#* }"
       case "$op" in
-        add) printf 'route replace %s via %s dev %s\n' "$cidr" "$tip" "$tdev" ;;
-        del) printf 'route del %s\n' "$cidr" ;;
+        add) printf 'route replace %s via %s dev %s table %s\n' "$cidr" "$tip" "$tdev" "$table" ;;
+        del) printf 'route del %s table %s\n' "$cidr" "$table" ;;
         *) die "Внутренняя ошибка: bad op '$op'" ;;
       esac
     done
@@ -331,6 +339,14 @@ apply_force_changes() {
   fi
   rm -f "$tmp"
   log "Применено изменений force-маршрутов: ${#ops[@]}"
+}
+
+# Номер direct-таблицы: из state работающего туннеля (там значения клиента),
+# иначе env/default. Маршруты include/exclude живут в этой таблице.
+policy_table_direct_runtime() {
+  local t=""
+  t="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${POLICY_TABLE_DIRECT:-}"' 2>/dev/null || true)"
+  [[ -n "$t" ]] && printf '%s' "$t" || printf '%s' "$POLICY_TABLE_DIRECT"
 }
 
 # Есть ли в автогенных файлах неразвёрнутые токены (ASnnnn / ISO-код)?

@@ -144,7 +144,33 @@ sshtun list         # эффективная политика: include-force + 4
 ```
 
 После `restart` маршруты из includes-force.txt и исключений должны быть
-на месте: `ip route | grep -c via` вырастет на количество префиксов.
+на месте: `ip route show table 200 | wc -l` вырастет на количество
+префиксов.
+
+## 4a. Policy routing (после обновления на таблицы)
+
+Маршруты живут в отдельных таблицах, main не трогается:
+
+```bash
+ip rule show | grep 2510        # ожидается 2 правила: 25100 -> 200, 25110 -> 201
+ip route                        # main чистая: default + connected, без префиксов
+ip route show table 200 | wc -l # ~11k: исключения direct + include via tun + LAN + bypass
+ip route show table 201         # 0.0.0.0/1 + 128.0.0.0/1 via tun
+ip route get 192.168.8.1        # LAN напрямую (table 200), не через tun
+```
+
+Проверка полного цикла (down не оставляет следов):
+
+```bash
+sshtun down
+ip rule show | grep -c 2510     # 0
+ip route show table 200 | wc -l # 0
+ip route show table 201 | wc -l # 0
+sshtun up
+```
+
+> Миграция: после обновления на эту версию выполните `sshtun restart`
+> один раз — старая схема (маршруты в main) будет зачищена автоматически.
 
 ## 5. Установщик
 
@@ -183,6 +209,8 @@ time ip -force -batch /tmp/bt.txt
 
 - [ ] `sshtun exclude add/del` меняют маршруты без перезапуска туннеля
 - [ ] `include add` побеждает exclude на равном префиксе; LPM-семантика (2c) верна
+- [ ] policy routing: правила 25100/25110 есть при работе, нет после `down`; main чистая (4a)
+- [ ] `restart`/`down`/`up` быстрые (~3 с / <1 с / ~3 с даже со списком страны)
 - [ ] `fetch-as`/`fetch-country`/`refresh` корректно объединяют и убирают источники
 - [ ] дифф в тысячи маршрутов применяется < 1 с
 - [ ] `restart` подхватывает все файлы, `status`/`doctor` без ошибок

@@ -89,6 +89,7 @@ Linux-клиент. Поддерживает:
 - split-tunnel режим;
 - route/include/exclude CIDR;
 - списки маршрутов из файлов;
+- policy routing (как Tailscale/Netbird): маршруты живут в отдельных таблицах (`POLICY_TABLE_DIRECT=200`, `POLICY_TABLE_TUN=201`, правила с приоритетами 25100/25110), main-таблица не изменяется — `ip route` остаётся чистым даже с десятками тысяч префиксов;
 - DNS через `resolvectl`;
 - IPv6 blackhole для защиты от IPv6 leak;
 - lock от параллельных стартов/остановок;

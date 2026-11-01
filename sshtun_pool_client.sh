@@ -10,6 +10,8 @@ IFS=$'\n\t'
 #   - cleanup command removes old traces without state file
 #   - lock prevents overlapping starts/stops
 #   - supports full-tunnel, custom tunnel routes and direct excludes
+#   - policy routing (Tailscale-style): routes live in dedicated tables
+#     (POLICY_TABLE_DIRECT/POLICY_TABLE_TUN), main table stays untouched
 #   - big route lists (country/AS CIDRs) are applied via ip -batch
 #   - route precedence: kernel LPM by prefix length; on equal prefix the
 #     tunnel/force route wins because excludes are applied first
@@ -80,6 +82,18 @@ EXCLUDE_ROUTES=()
 # Списки длиннее порога применяются одним netlink-транзакцией (ip -batch)
 # вместо посекундного цикла: 10k+ маршрутов добавляются/снимаются за секунды.
 ROUTE_BATCH_THRESHOLD="${ROUTE_BATCH_THRESHOLD:-100}"
+
+# Policy routing в стиле Tailscale/Netbird: маршруты живут в отдельных
+# таблицах, main-таблица не трогается. POLICY_TABLE_DIRECT — вся политика
+# (исключения direct, include-force через tun, bypass до сервера, копия
+# connected-маршрута LAN); POLICY_TABLE_TUN — только полутора default'а
+# full-tunnel (0.0.0.0/1 + 128.0.0.0/1). Правила с приоритетами ниже main
+# (32766): сначала direct-таблица, затем tunnel-таблица. Приоритеты 25100+
+# выбраны, чтобы не пересекаться с Tailscale (52xx) и Netbird (31xx).
+POLICY_TABLE_DIRECT="${POLICY_TABLE_DIRECT:-200}"
+POLICY_TABLE_TUN="${POLICY_TABLE_TUN:-201}"
+RULE_PREF_DIRECT="${RULE_PREF_DIRECT:-25100}"
+RULE_PREF_TUN="${RULE_PREF_TUN:-25110}"
 
 log(){ echo "[$(date -Is)] $*"; }
 die(){ echo "[ERROR] $*" >&2; exit 1; }
@@ -159,9 +173,12 @@ validate_cidr_or_ip() {
 read_routes_file() {
   local file="$1" target_array="$2" line=""
   [[ -f "$file" ]] || die "Route file not found: $file"
+  # Чистка строк — чистым bash (без sed/awk на строку): страны дают 10k+
+  # строк, и fork на каждую стоил ~70 с парсинга при каждом старте.
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%#*}"
-    line="$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$line")"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
     validate_cidr_or_ip "$line" || die "Bad route in $file: $line"
     if [[ "$target_array" == "ROUTES_VIA_TUN" ]]; then
@@ -266,21 +283,53 @@ detect_default_route() {
 }
 
 add_direct_route() {
-  local cidr="$1"
+  local cidr="$1" table="${2:-$POLICY_TABLE_DIRECT}"
   if [[ -n "$DEFAULT_GW" ]]; then
-    ip route replace "$cidr" via "$DEFAULT_GW" dev "$DEFAULT_DEV"
+    ip route replace "$cidr" via "$DEFAULT_GW" dev "$DEFAULT_DEV" table "$table"
   else
-    ip route replace "$cidr" dev "$DEFAULT_DEV"
+    ip route replace "$cidr" dev "$DEFAULT_DEV" table "$table"
   fi
 }
 
-# Применить список маршрутов. mode: tun | direct | del.
-# Приоритет маршрутов определяется ядром по длине префикса (LPM): более
-# специфичный префикс побеждает независимо от порядка добавления. На равных
-# префиксах побеждает тот, кто применён последним — поэтому exclude-списки
-# добавляются раньше tunnel/force-роутов (см. configure_client_routes).
+install_policy_rules() {
+  ip rule del pref "$RULE_PREF_DIRECT" 2>/dev/null || true
+  ip rule del pref "$RULE_PREF_TUN" 2>/dev/null || true
+  ip rule add pref "$RULE_PREF_DIRECT" lookup "$POLICY_TABLE_DIRECT"
+  ip rule add pref "$RULE_PREF_TUN" lookup "$POLICY_TABLE_TUN"
+}
+
+remove_policy_rules() {
+  ip rule del pref "$RULE_PREF_DIRECT" 2>/dev/null || true
+  ip rule del pref "$RULE_PREF_TUN" 2>/dev/null || true
+}
+
+# Копия connected-маршрута физического интерфейса в таблицу политики.
+# Без неё LAN-трафик (роутер, принтеры, 192.168.x.x) ушёл бы в туннель:
+# правила 25100/25110 перекрывают main-таблицу, где живёт connected-маршрут.
+install_lan_route() {
+  local lan=""
+  lan="$(ip -4 route show dev "$DEFAULT_DEV" scope link proto kernel | head -n1)"
+  [[ -n "$lan" ]] || return 0
+  local prefix=""
+  prefix="${lan%% *}"
+  [[ "$prefix" =~ ^[0-9.]+/[0-9]+$ ]] || return 0
+  ip route replace "$prefix" dev "$DEFAULT_DEV" table "$POLICY_TABLE_DIRECT"
+}
+
+# Bypass до реального IP сервера в таблице политики (правила уже активны).
+add_policy_bypass_route() {
+  add_direct_route "${SERVER_REAL_IP}/32" "$POLICY_TABLE_DIRECT"
+}
+
+# Применить список маршрутов. mode: tun | direct | del; $2 — таблица
+# ("main" тоже допустима). Приоритет маршрутов определяется ядром по длине
+# префикса (LPM): более специфичный префикс побеждает независимо от порядка
+# добавления. На равных префиксах побеждает тот, кто применён последним —
+# поэтому exclude-списки добавляются раньше include/tunnel-роутов
+# (см. configure_client_routes). Все политические маршруты живут в ОДНОЙ
+# таблице POLICY_TABLE_DIRECT, поэтому семантика равных префиксов сохраняется.
 apply_route_list() {
-  local mode="$1"; shift
+  local mode="$1" table="$2"; shift 2
   local routes=("$@")
   ((${#routes[@]} > 0)) || return 0
 
@@ -293,25 +342,28 @@ apply_route_list() {
       for r in "${routes[@]}"; do
         [[ -n "$r" ]] || continue
         case "$mode" in
-          tun)    printf 'route replace %s via %s dev %s\n' "$r" "$SERVER_TUN_IP" "$TUN_DEV" ;;
+          tun)    printf 'route replace %s via %s dev %s table %s\n' "$r" "$SERVER_TUN_IP" "$TUN_DEV" "$table" ;;
           direct) if [[ -n "$DEFAULT_GW" ]]; then
-                    printf 'route replace %s via %s dev %s\n' "$r" "$DEFAULT_GW" "$DEFAULT_DEV"
+                    printf 'route replace %s via %s dev %s table %s\n' "$r" "$DEFAULT_GW" "$DEFAULT_DEV" "$table"
                   else
-                    printf 'route replace %s dev %s\n' "$r" "$DEFAULT_DEV"
+                    printf 'route replace %s dev %s table %s\n' "$r" "$DEFAULT_DEV" "$table"
                   fi ;;
-          del)    printf 'route del %s\n' "$r" ;;
+          del)    printf 'route del %s table %s\n' "$r" "$table" ;;
           *) die "Bad apply_route_list mode: $mode" ;;
         esac
       done
     } > "$batch"
-    # del: отсутствие части маршрутов нормально (уже сняты), rc игнорируем.
-    if [[ "$mode" != "del" ]] && ! ip -force -batch "$batch" >/dev/null 2>&1; then
+    # Батч запускается ВСЕГДА; для del ненулевой rc (часть маршрутов уже
+    # снята) — норма, fallback на построчное применение — только для add.
+    local rc=0
+    ip -force -batch "$batch" >/dev/null 2>&1 || rc=1
+    if (( rc != 0 )) && [[ "$mode" != "del" ]]; then
       log "WARNING: batch route apply failed; falling back to per-route"
       for r in "${routes[@]}"; do
         [[ -n "$r" ]] || continue
         case "$mode" in
-          tun)    ip route replace "$r" via "$SERVER_TUN_IP" dev "$TUN_DEV" 2>/dev/null || true ;;
-          direct) add_direct_route "$r" 2>/dev/null || true ;;
+          tun)    ip route replace "$r" via "$SERVER_TUN_IP" dev "$TUN_DEV" table "$table" 2>/dev/null || true ;;
+          direct) add_direct_route "$r" "$table" 2>/dev/null || true ;;
         esac
       done
     fi
@@ -323,9 +375,9 @@ apply_route_list() {
   for r in "${routes[@]}"; do
     [[ -n "$r" ]] || continue
     case "$mode" in
-      tun)    ip route replace "$r" via "$SERVER_TUN_IP" dev "$TUN_DEV" ;;
-      direct) add_direct_route "$r" ;;
-      del)    ip route del "$r" 2>/dev/null || true ;;
+      tun)    ip route replace "$r" via "$SERVER_TUN_IP" dev "$TUN_DEV" table "$table" ;;
+      direct) add_direct_route "$r" "$table" ;;
+      del)    ip route del "$r" table "$table" 2>/dev/null || true ;;
       *) die "Bad apply_route_list mode: $mode" ;;
     esac
   done
@@ -358,6 +410,14 @@ write_state() {
     printf 'LOAD_KEY_IN_AGENT=%q\n' "$LOAD_KEY_IN_AGENT"
     printf 'REMOTE_SETUP=%q\n' "$REMOTE_SETUP"
     printf 'REMOTE_WAN_DEV=%q\n' "$REMOTE_WAN_DEV"
+    printf 'POLICY_TABLE_DIRECT=%q\n' "$POLICY_TABLE_DIRECT"
+    printf 'POLICY_TABLE_TUN=%q\n' "$POLICY_TABLE_TUN"
+    printf 'RULE_PREF_DIRECT=%q\n' "$RULE_PREF_DIRECT"
+    printf 'RULE_PREF_TUN=%q\n' "$RULE_PREF_TUN"
+    # Маркер схемы маршрутизации: cleanup старых (main-table) туннелей
+    # обязан дочищать per-prefix маршруты из main, новым это не нужно
+    # (их маршруты в политических таблицах, снимаются flush'ем).
+    printf 'POLICY_ROUTES=%q\n' "1"
     printf 'TUN_NET_A=%q\n' "$TUN_NET_A"
     printf 'TUN_NET_B=%q\n' "$TUN_NET_B"
     printf 'TUN_PREFIX=%q\n' "$TUN_PREFIX"
@@ -374,7 +434,11 @@ write_state() {
 load_state_if_exists() {
   [[ -f "$STATE_FILE" ]] || return 1
   # shellcheck disable=SC1090
-  source "$STATE_FILE"
+  # ВАЖНО: state содержит вывод declare -p, но declare внутри функции
+  # (а source здесь выполняется в её контексте) создаёт ЛОКАЛЬНЫЕ
+  # переменные — массивы маршрутов терялись, и cleanup снимал не всё.
+  # declare снимаем sed'ом, оставляя чистое присваивание = глобальное.
+  eval "$(sed -E 's/^declare -a ([A-Za-z_][A-Za-z0-9_]*)=/\1=/' "$STATE_FILE")"
   return 0
 }
 
@@ -461,16 +525,25 @@ explain_nonretryable_ssh_failure() {
 cleanup_routes() {
   local dev="${1:-}" real_ip="${2:-}" had_v6="${3:-0}"
 
-  while ip -4 route show 0.0.0.0/1 2>/dev/null | grep -q .; do ip route del 0.0.0.0/1 2>/dev/null || break; done
-  while ip -4 route show 128.0.0.0/1 2>/dev/null | grep -q .; do ip route del 128.0.0.0/1 2>/dev/null || break; done
+  # Политические таблицы выключаются целиком — они принадлежат нам.
+  ip route flush table "$POLICY_TABLE_TUN" 2>/dev/null || true
+  ip route flush table "$POLICY_TABLE_DIRECT" 2>/dev/null || true
 
-  if [[ -n "${ROUTES_VIA_TUN[*]:-}" ]]; then
-    apply_route_list del "${ROUTES_VIA_TUN[@]:-}"
+  # Legacy: туннель, поднятый старой схемой (main-table), держал per-prefix
+  # маршруты в main. Только для таких (state без маркера POLICY_ROUTES)
+  # дочищаем main построчно; у новых схема снимается flush'ем таблиц выше.
+  if [[ "${POLICY_ROUTES:-0}" != "1" ]]; then
+    while ip -4 route show 0.0.0.0/1 2>/dev/null | grep -q .; do ip route del 0.0.0.0/1 2>/dev/null || break; done
+    while ip -4 route show 128.0.0.0/1 2>/dev/null | grep -q .; do ip route del 128.0.0.0/1 2>/dev/null || break; done
+    if [[ -n "${ROUTES_VIA_TUN[*]:-}" ]]; then
+      apply_route_list del main "${ROUTES_VIA_TUN[@]:-}"
+    fi
+    if [[ -n "${EXCLUDE_ROUTES[*]:-}" ]]; then
+      apply_route_list del main "${EXCLUDE_ROUTES[@]:-}"
+    fi
   fi
 
-  if [[ -n "${EXCLUDE_ROUTES[*]:-}" ]]; then
-    apply_route_list del "${EXCLUDE_ROUTES[@]:-}"
-  fi
+  remove_policy_rules
 
   if [[ -n "$real_ip" ]]; then
     ip route del "${real_ip}/32" 2>/dev/null || true
@@ -610,6 +683,8 @@ status_vpn() {
       echo "TUN: ${TUN_DEV}"
       echo "Client IP: ${CLIENT_TUN_IP}"
       echo "Server TUN IP: ${SERVER_TUN_IP}"
+      echo "Policy: table ${POLICY_TABLE_DIRECT} (pref ${RULE_PREF_DIRECT}), table ${POLICY_TABLE_TUN} (pref ${RULE_PREF_TUN})"
+      echo "Policy routes: direct=$(ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null | wc -l) tun=$(ip -4 route show table "$POLICY_TABLE_TUN" 2>/dev/null | wc -l)"
       ip addr show "$TUN_DEV" 2>/dev/null | sed -n '1,8p' || true
     else
       echo "Status: stale state, SSH process is not running"
@@ -648,6 +723,15 @@ doctor_vpn() {
   ip -4 route show default || true
   ip -4 route show 0.0.0.0/1 || true
   ip -4 route show 128.0.0.0/1 || true
+  echo
+  echo "== policy routing =="
+  ip rule show pref "$RULE_PREF_DIRECT" 2>/dev/null || true
+  ip rule show pref "$RULE_PREF_TUN" 2>/dev/null || true
+  echo "-- table ${POLICY_TABLE_DIRECT} (policy: excludes direct + includes via tun) --"
+  ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null | sed -n '1,20p' || true
+  echo "total: $(ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null | wc -l) routes"
+  echo "-- table ${POLICY_TABLE_TUN} (full-tunnel halves) --"
+  ip -4 route show table "$POLICY_TABLE_TUN" 2>/dev/null || true
   echo
   echo "== IPv6 blackhole =="
   ip -6 route show 2>/dev/null | grep -F 'blackhole ::/0 metric 1' || true
@@ -840,29 +924,46 @@ start_ssh_attempt() {
 }
 
 configure_client_routes() {
+  install_policy_rules
+
   if [[ "$FULL_TUNNEL" == "1" ]]; then
-    log "Enabling full-tunnel IPv4 routes"
-    ip route replace 0.0.0.0/1 via "$SERVER_TUN_IP" dev "$TUN_DEV"
-    ip route replace 128.0.0.0/1 via "$SERVER_TUN_IP" dev "$TUN_DEV"
+    log "Enabling full-tunnel IPv4 routes (table $POLICY_TABLE_TUN)"
+    ip route replace 0.0.0.0/1 via "$SERVER_TUN_IP" dev "$TUN_DEV" table "$POLICY_TABLE_TUN"
+    ip route replace 128.0.0.0/1 via "$SERVER_TUN_IP" dev "$TUN_DEV" table "$POLICY_TABLE_TUN"
   fi
 
-  # Сначала direct-исключения, затем маршруты через туннель: при равном
-  # префиксе tunnel/force-роут перекрывает exclude (LPM на неравных — как всегда).
+  # LAN connected route — иначе локалка уйдёт в туннель (main перекрыта
+  # правилами). Фиксируется на момент старта; при смене сети — restart.
+  install_lan_route
+  # SSH до сервера не должен попасть в туннель (правила уже активны).
+  add_policy_bypass_route
+
+  # Сначала direct-исключения, затем include/tunnel-роуты: при равном
+  # префиксе include перекрывает exclude (LPM на неравных — как всегда).
+  # Все — в одной таблице POLICY_TABLE_DIRECT, семантика прежняя.
   local r=""
-  for r in "${EXCLUDE_ROUTES[@]:-}"; do
-    [[ -z "$r" ]] && continue
-    log "Adding direct exclude route: $r via ${DEFAULT_DEV}"
-  done
-  if [[ -n "${EXCLUDE_ROUTES[*]:-}" ]]; then
-    apply_route_list direct "${EXCLUDE_ROUTES[@]:-}"
+  if ((${#EXCLUDE_ROUTES[@]} > 0)); then
+    if ((${#EXCLUDE_ROUTES[@]} <= ROUTE_BATCH_THRESHOLD)); then
+      for r in "${EXCLUDE_ROUTES[@]:-}"; do
+        [[ -z "$r" ]] && continue
+        log "Adding direct exclude route: $r via ${DEFAULT_DEV} table ${POLICY_TABLE_DIRECT}"
+      done
+    else
+      log "Adding ${#EXCLUDE_ROUTES[@]} direct exclude routes via ${DEFAULT_DEV} table ${POLICY_TABLE_DIRECT} (batch)"
+    fi
+    apply_route_list direct "$POLICY_TABLE_DIRECT" "${EXCLUDE_ROUTES[@]:-}"
   fi
 
-  for r in "${ROUTES_VIA_TUN[@]:-}"; do
-    [[ -z "$r" ]] && continue
-    log "Adding tunnel route: $r via $TUN_DEV"
-  done
-  if [[ -n "${ROUTES_VIA_TUN[*]:-}" ]]; then
-    apply_route_list tun "${ROUTES_VIA_TUN[@]:-}"
+  if ((${#ROUTES_VIA_TUN[@]} > 0)); then
+    if ((${#ROUTES_VIA_TUN[@]} <= ROUTE_BATCH_THRESHOLD)); then
+      for r in "${ROUTES_VIA_TUN[@]:-}"; do
+        [[ -z "$r" ]] && continue
+        log "Adding tunnel route: $r via $TUN_DEV table ${POLICY_TABLE_DIRECT}"
+      done
+    else
+      log "Adding ${#ROUTES_VIA_TUN[@]} tunnel routes via $TUN_DEV table ${POLICY_TABLE_DIRECT} (batch)"
+    fi
+    apply_route_list tun "$POLICY_TABLE_DIRECT" "${ROUTES_VIA_TUN[@]:-}"
   fi
 
   if [[ "$SET_DNS" == "1" ]]; then
