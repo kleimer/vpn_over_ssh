@@ -285,10 +285,24 @@ apply_force_changes() {
   log "Применено изменений force-маршрутов: ${#ops[@]}"
 }
 
+# Есть ли в автогенных файлах неразвёрнутые токены (ASnnnn / ISO-код)?
+autogen_has_tokens() {
+  local f=""
+  for f in "$AS_EXCLUDES" "$COUNTRY_EXCLUDES"; do
+    [[ -f "$f" ]] && grep -qE '^(AS[0-9]+|[A-Za-z]{2})$' "$f" && return 0
+  done
+  return 1
+}
+
 start_vpn() {
   check_client
   check_excludes
   check_key
+  # Токены, дописанные в автогенные файлы вручную, разворачиваем перед стартом.
+  if autogen_has_tokens; then
+    log "В автогенных файлах есть неразвёрнутые AS/коды стран — выполняю refresh"
+    refresh_lists || die "refresh не удался — исправьте файлы или сеть и повторите"
+  fi
   log "Поднимаю туннель: $SSH_USER@$SERVER_HOST:$SERVER_PORT (пул tun$TUN_START..tun$TUN_END)"
   local args=(
     --host "$SERVER_HOST"
@@ -427,14 +441,25 @@ ipdeny_prefixes() {
     | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$'
 }
 
-# Объединить старые источники из шапки файла с новыми аргументами (уникально).
-# Печатает по одному источнику на строку.
+# Источники файла: шапка (# sshtun-managed-sources:) + вручную дописанные
+# в тело токены (ASnnnn или ISO-код страны), через пробел. Печатает одну строку.
+file_sources() {
+  local file="$1"
+  {
+    managed_sources "$file"
+    if [[ -f "$file" ]]; then
+      grep -E '^(AS[0-9]+|[A-Za-z]{2})$' "$file" || true
+    fi
+  } | tr '\n' ' '
+}
+
+# Источники файла ПЛЮС новые аргументы (уникально). По одному на строку.
 merge_sources() {
   local file="$1"; shift
   local -A seen=()
   local s="" line=""
   local -a old=()
-  line="$(managed_sources "$file")"
+  line="$(file_sources "$file")"
   IFS=' ' read -r -a old <<<"$line"
   for s in "${old[@]}"; do
     [[ -n "$s" ]] || continue
@@ -452,14 +477,16 @@ join_spaced() {
   printf '%s' "${out% }"
 }
 
-# Источники из шапки файла МИНУС указанные (для --remove). По одному на строку.
+# Источники файла МИНУС указанные (для --remove). По одному на строку.
+# Вручную дописанные токены из тела учитываются: удалённый токен не
+# воскреснет при следующем refresh.
 subtract_sources() {
   local file="$1"; shift
   local -A rm=()
   local s="" line=""
   local -a old=()
   for s in "$@"; do rm[$s]=1; done
-  line="$(managed_sources "$file")"
+  line="$(file_sources "$file")"
   IFS=' ' read -r -a old <<<"$line"
   for s in "${old[@]}"; do
     [[ -n "$s" ]] || continue
@@ -477,8 +504,10 @@ write_managed_file() {
   local tmp
   tmp="$(mktemp)" || die "mktemp failed"
   {
-    echo "# SSHTUN: АВТОГЕНЕРАЦИЯ. Не править вручную — файл перезаписывается"
-    echo "# командами: fetch-as / fetch-country / refresh."
+    echo "# SSHTUN: АВТОГЕНЕРАЦИЯ. Не править префиксы вручную — файл перезаписывается"
+    echo "# командами: fetch-as / fetch-country / refresh (в т.ч. автоматически при up)."
+    echo "# Дописывать можно токены-источники: AS9009 (AS) или ru/de/us (страны, ISO) —"
+    echo "# они развернутся в префиксы при следующем refresh."
     echo "# Источники: $sources"
     echo "# Данные: $datasource"
     echo "# Обновлено: $(date -Is)"
@@ -643,9 +672,23 @@ fetch_country() {
 
 refresh_lists() {
   log "Обновляю автогенные списки"
-  local as_sources cc_sources
-  as_sources="$(managed_sources "$AS_EXCLUDES")"
-  cc_sources="$(managed_sources "$COUNTRY_EXCLUDES")"
+  # Источники берутся из обоих автогенных файлов (шапка + токены в теле)
+  # и распределяются по форме: ASnnnn -> fetch_as, иначе -> fetch_country.
+  local all_sources="" as_sources="" cc_sources="" tok=""
+  all_sources="$(file_sources "$AS_EXCLUDES") $(file_sources "$COUNTRY_EXCLUDES")"
+  local -a toks=()
+  local -A seen=()
+  IFS=' ' read -r -a toks <<<"$all_sources"
+  for tok in "${toks[@]}"; do
+    [[ -n "$tok" ]] || continue
+    [[ -n "${seen[$tok]:-}" ]] && continue
+    seen[$tok]=1
+    if [[ "$tok" =~ ^AS[0-9]+$ ]]; then
+      as_sources+="$tok "
+    else
+      cc_sources+="$tok "
+    fi
+  done
 
   if [[ -n "$as_sources" ]]; then
     local -a arr=()
