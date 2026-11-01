@@ -38,6 +38,12 @@ tun200 -> server 10.250.1.145, client 10.250.1.146
 ```text
 .
 ├── CHANGELOG.md
+├── docs/
+│   └── HOWTO.md                — инструкция по тестированию клиента
+├── examples/                   — шаблоны файлов маршрутной политики
+│   ├── excludes.txt
+│   └── excludes-custom.txt
+├── install_client.sh           — установка/удаление/обновление Linux-клиента
 ├── install_server.sh
 ├── sshtun_full.sh
 ├── sshtun_pool_client.sh
@@ -90,20 +96,48 @@ Linux-клиент. Поддерживает:
 - работу с passphrase-protected ключами через `ssh-agent` или `--ask-passphrase`;
 - `status`, `doctor`, `cleanup`.
 
+### `install_client.sh`
+
+Установщик Linux-клиента. Разделяет «репозиторий для разработки» и
+«установленный клиент»: скрипты копируются в `/opt/sshtun_client/`, а в
+`/usr/local/bin/` создаётся команда `sshtun` (symlink). Запускать из
+репозитория больше не нужно.
+
+```bash
+sudo bash install_client.sh install      # установить или обновить копию
+sudo bash install_client.sh update       # git pull + install
+sudo bash install_client.sh reinstall    # переустановка
+sudo bash install_client.sh uninstall    # убрать /opt и symlink (~/sshtun остаётся)
+sudo bash install_client.sh uninstall --purge   # и данные ~/sshtun тоже
+```
+
+При первой установке создаёт `~/sshtun/` из шаблонов `examples/`
+(существующие файлы не трогает). Проверка и сценарии: [`docs/HOWTO.md`](docs/HOWTO.md).
+
 ### `sshtun_full.sh`
 
 Обёртка над `sshtun_pool_client.sh` для постоянного режима «full-tunnel + исключения» (см. `CHANGELOG.md`). Поддерживает:
 
 - `up` / `down` / `restart` / `status` / `doctor` / `cleanup`;
-- два файла исключений (трафик на них идёт напрямую, мимо туннеля): `~/sshtun/excludes.txt` — базовые (RFC1918 и админские сети) и `~/sshtun/excludes-custom.txt` — пополняемый пользовательский список;
-- `add CIDR...` — добавить сети/адреса в исключения: дописывает в файл и, если туннель поднят, сразу ставит direct-маршрут без перезапуска;
-- параметры подключения (хост, порт, ключ, пул tun, MTU) — переменные в шапке скрипта.
+- файлы маршрутной политики в `~/sshtun/`:
+  - `excludes.txt` — базовые исключения (RFC1918 и админские сети), трафик идёт напрямую;
+  - `excludes-custom.txt` — пополняемый пользователем список исключений;
+  - `excludes-as.txt` — автогенерация: префиксы автономных систем (команды `fetch-as` / `refresh`; не править руками);
+  - `excludes-country.txt` — автогенерация: префиксы стран по ISO-кодам (`fetch-country` / `refresh`, данные ipdeny.com; не править руками);
+  - `includes-force.txt` — принудительно «в туннель», приоритет над exclude-файлами;
+- команды: `add` / `del` (пользовательские исключения), `force-add` / `force-del` (force-список), `fetch-as AS... [--irr] [--remove AS...]`, `fetch-country CC... [--remove CC...]`, `refresh` (перекачка автогенных списков), `list` (показ эффективной политики);
+- изменения применяются сразу, без перезапуска, если туннель поднят; массовые изменения (тысячи префиксов) идут одним netlink-батчем `ip -batch` (5000 маршрутов — ~0.2 с);
+- приоритет маршрутов: ядро выбирает самый длинный префикс (LPM); на равных префиксах force побеждает exclude.
 
-Пример:
+После установки (`install_client.sh`) обёртка доступна как команда `sshtun`:
 
 ```bash
-~/GIT/vpn_over_ssh/sshtun_full.sh up
-~/GIT/vpn_over_ssh/sshtun_full.sh add 203.0.113.0/24
+sshtun up
+sshtun add 203.0.113.0/24
+sshtun fetch-as AS9009
+sshtun fetch-country ru
+sshtun force-add 198.51.100.7
+sshtun list
 ```
 
 ### `sshtun_pool_windows_client/`
@@ -725,8 +759,9 @@ sshtun_pool_windows_client/internal/**
 6. Добавить GUI/Tray-клиент поверх CLI-ядра.
 7. Подписать Windows/macOS binaries и installer.
 8. Добавить автообновление клиента.
-9. Вынести большие списки маршрутов, например country CIDR, в отдельный обновляемый файл/сервис.
+9. Вынести большие списки маршрутов, например country CIDR, в отдельный обновляемый файл/сервис. — сделано: `sshtun fetch-as` / `fetch-country` / `refresh` (2026-11-01)
 10. Добавить полноценный healthcheck: SSH connect, tunnel up, DNS, public IP, route test, packet pump stats.
+11. GUI-оболочка для Linux и macOS поверх CLI-ядра: старт/стоп туннеля, статус, просмотр логов и конфигов, вызов редактора. Планируется следующим релизом после тега текущих изменений.
 
 ## Короткая шпаргалка
 
