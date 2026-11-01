@@ -10,6 +10,9 @@ IFS=$'\n\t'
 #   - cleanup command removes old traces without state file
 #   - lock prevents overlapping starts/stops
 #   - supports full-tunnel, custom tunnel routes and direct excludes
+#   - big route lists (country/AS CIDRs) are applied via ip -batch
+#   - route precedence: kernel LPM by prefix length; on equal prefix the
+#     tunnel/force route wins because excludes are applied first
 #   - supports passphrase-protected keys via existing ssh-agent or temporary ssh-agent
 #   - preserves /run/sshtun/ssh.last.log after failed starts
 #   - stops retrying tun pool on deterministic SSH auth/port failures
@@ -73,6 +76,10 @@ HAD_IPV6_BLACKHOLE="0"
 
 ROUTES_VIA_TUN=()
 EXCLUDE_ROUTES=()
+
+# Списки длиннее порога применяются одним netlink-транзакцией (ip -batch)
+# вместо посекундного цикла: 10k+ маршрутов добавляются/снимаются за секунды.
+ROUTE_BATCH_THRESHOLD="${ROUTE_BATCH_THRESHOLD:-100}"
 
 log(){ echo "[$(date -Is)] $*"; }
 die(){ echo "[ERROR] $*" >&2; exit 1; }
@@ -267,6 +274,63 @@ add_direct_route() {
   fi
 }
 
+# Применить список маршрутов. mode: tun | direct | del.
+# Приоритет маршрутов определяется ядром по длине префикса (LPM): более
+# специфичный префикс побеждает независимо от порядка добавления. На равных
+# префиксах побеждает тот, кто применён последним — поэтому exclude-списки
+# добавляются раньше tunnel/force-роутов (см. configure_client_routes).
+apply_route_list() {
+  local mode="$1"; shift
+  local routes=("$@")
+  ((${#routes[@]} > 0)) || return 0
+
+  if ((${#routes[@]} >= ROUTE_BATCH_THRESHOLD)); then
+    local batch="" r="" rc=0
+    batch="$(mktemp)" || die "mktemp failed"
+    # Один редирект на весь цикл: построчное ">> "$batch"" на хостах с аудитом
+    # открытий файлов стоит ~7 мс на итерацию (35 с на 5000 маршрутов).
+    {
+      for r in "${routes[@]}"; do
+        [[ -n "$r" ]] || continue
+        case "$mode" in
+          tun)    printf 'route replace %s via %s dev %s\n' "$r" "$SERVER_TUN_IP" "$TUN_DEV" ;;
+          direct) if [[ -n "$DEFAULT_GW" ]]; then
+                    printf 'route replace %s via %s dev %s\n' "$r" "$DEFAULT_GW" "$DEFAULT_DEV"
+                  else
+                    printf 'route replace %s dev %s\n' "$r" "$DEFAULT_DEV"
+                  fi ;;
+          del)    printf 'route del %s\n' "$r" ;;
+          *) die "Bad apply_route_list mode: $mode" ;;
+        esac
+      done
+    } > "$batch"
+    # del: отсутствие части маршрутов нормально (уже сняты), rc игнорируем.
+    if [[ "$mode" != "del" ]] && ! ip -force -batch "$batch" >/dev/null 2>&1; then
+      log "WARNING: batch route apply failed; falling back to per-route"
+      for r in "${routes[@]}"; do
+        [[ -n "$r" ]] || continue
+        case "$mode" in
+          tun)    ip route replace "$r" via "$SERVER_TUN_IP" dev "$TUN_DEV" 2>/dev/null || true ;;
+          direct) add_direct_route "$r" 2>/dev/null || true ;;
+        esac
+      done
+    fi
+    rm -f "$batch"
+    return 0
+  fi
+
+  local r=""
+  for r in "${routes[@]}"; do
+    [[ -n "$r" ]] || continue
+    case "$mode" in
+      tun)    ip route replace "$r" via "$SERVER_TUN_IP" dev "$TUN_DEV" ;;
+      direct) add_direct_route "$r" ;;
+      del)    ip route del "$r" 2>/dev/null || true ;;
+      *) die "Bad apply_route_list mode: $mode" ;;
+    esac
+  done
+}
+
 add_server_bypass_route() {
   add_direct_route "${SERVER_REAL_IP}/32"
 }
@@ -401,17 +465,11 @@ cleanup_routes() {
   while ip -4 route show 128.0.0.0/1 2>/dev/null | grep -q .; do ip route del 128.0.0.0/1 2>/dev/null || break; done
 
   if [[ -n "${ROUTES_VIA_TUN[*]:-}" ]]; then
-    local r=""
-    for r in "${ROUTES_VIA_TUN[@]:-}"; do
-      [[ -n "$r" ]] && ip route del "$r" 2>/dev/null || true
-    done
+    apply_route_list del "${ROUTES_VIA_TUN[@]:-}"
   fi
 
   if [[ -n "${EXCLUDE_ROUTES[*]:-}" ]]; then
-    local r=""
-    for r in "${EXCLUDE_ROUTES[@]:-}"; do
-      [[ -n "$r" ]] && ip route del "$r" 2>/dev/null || true
-    done
+    apply_route_list del "${EXCLUDE_ROUTES[@]:-}"
   fi
 
   if [[ -n "$real_ip" ]]; then
@@ -788,18 +846,24 @@ configure_client_routes() {
     ip route replace 128.0.0.0/1 via "$SERVER_TUN_IP" dev "$TUN_DEV"
   fi
 
+  # Сначала direct-исключения, затем маршруты через туннель: при равном
+  # префиксе tunnel/force-роут перекрывает exclude (LPM на неравных — как всегда).
   local r=""
-  for r in "${ROUTES_VIA_TUN[@]:-}"; do
-    [[ -z "$r" ]] && continue
-    log "Adding tunnel route: $r via $TUN_DEV"
-    ip route replace "$r" via "$SERVER_TUN_IP" dev "$TUN_DEV"
-  done
-
   for r in "${EXCLUDE_ROUTES[@]:-}"; do
     [[ -z "$r" ]] && continue
     log "Adding direct exclude route: $r via ${DEFAULT_DEV}"
-    add_direct_route "$r"
   done
+  if [[ -n "${EXCLUDE_ROUTES[*]:-}" ]]; then
+    apply_route_list direct "${EXCLUDE_ROUTES[@]:-}"
+  fi
+
+  for r in "${ROUTES_VIA_TUN[@]:-}"; do
+    [[ -z "$r" ]] && continue
+    log "Adding tunnel route: $r via $TUN_DEV"
+  done
+  if [[ -n "${ROUTES_VIA_TUN[*]:-}" ]]; then
+    apply_route_list tun "${ROUTES_VIA_TUN[@]:-}"
+  fi
 
   if [[ "$SET_DNS" == "1" ]]; then
     if command -v resolvectl >/dev/null 2>&1; then
