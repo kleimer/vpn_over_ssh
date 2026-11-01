@@ -708,16 +708,26 @@ refresh_lists() {
 }
 
 list_policy() {
-  local f="" title="" n=0
-  echo "=== FORCE (всегда в туннель; на равных префиксах побеждает exclude-ы):"
-  echo "    $FORCE_INCLUDES"
+  local f="" title="" n=0 t=0
+  echo "=== INCLUDE (принудительно В ТУННЕЛЬ; на равных префиксах побеждает exclude-ы):"
+  echo "    добавить: sshtun include add CIDR...    убрать: sshtun include del CIDR..."
+  echo "    файл: $FORCE_INCLUDES"
   if [[ -f "$FORCE_INCLUDES" ]]; then
-    list_entries "$FORCE_INCLUDES" | sed 's/^/    /'
+    n="$(list_entries "$FORCE_INCLUDES" | grep -c . || true)"
+    if (( n > 0 )); then
+      list_entries "$FORCE_INCLUDES" | sed 's/^/      /'
+    else
+      echo "      (пусто)"
+    fi
   else
-    echo "    (файла нет — force-список не используется)"
+    echo "      (пусто — файла нет, создастся первой командой include add)"
   fi
   echo
-  echo "=== EXCLUDES (напрямую, мимо туннеля):"
+  echo "=== EXCLUDE (напрямую, мимо туннеля):"
+  echo "    свои сети:  sshtun exclude add CIDR...   (или строки CIDR в excludes-custom.txt)"
+  echo "    целые AS:   sshtun fetch-as AS9009       (или токен AS9009 в файле 'автоген AS')"
+  echo "    страны:     sshtun fetch-country ru      (или токен ru в файле 'автоген страны')"
+  echo
   for f in "$BASE_EXCLUDES" "$CUSTOM_EXCLUDES" "$AS_EXCLUDES" "$COUNTRY_EXCLUDES"; do
     case "$f" in
       "$BASE_EXCLUDES") title="базовые" ;;
@@ -727,16 +737,27 @@ list_policy() {
     esac
     if [[ -f "$f" ]]; then
       n="$(list_entries "$f" | grep -c . || true)"
+      t="$(grep -cE '^(AS[0-9]+|[A-Za-z]{2})$' "$f" || true)"
       printf '    %-18s %6s префиксов  %s\n' "$title" "$n" "$f"
+      if (( t > 0 )); then
+        printf '    %-18s %6s токен(ов) — развернуть: sshtun refresh (или up/restart)\n' "" "$t"
+      fi
       if (( n > 0 && n <= 50 )); then
         list_entries "$f" | sed 's/^/      /'
       fi
     else
-      printf '    %-18s %6s            %s\n' "$title" "—" "$f (нет файла)"
+      case "$f" in
+        "$AS_EXCLUDES")
+          printf '    %-18s %6s            %s\n' "$title" "—" "$f (создаётся: fetch-as или токен AS в файле)" ;;
+        "$COUNTRY_EXCLUDES")
+          printf '    %-18s %6s            %s\n' "$title" "—" "$f (создаётся: fetch-country или токен ru в файле)" ;;
+        *)
+          printf '    %-18s %6s            %s\n' "$title" "—" "$f (нет файла)" ;;
+      esac
     fi
   done
   echo
-  echo "Приоритет: более длинный префикс побеждает всегда (LPM); на равных — force."
+  echo "Приоритет: более длинный префикс побеждает всегда (LPM); на равных — include."
 }
 
 legacy_hint() {
