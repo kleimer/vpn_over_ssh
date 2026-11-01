@@ -125,18 +125,18 @@ sudo bash install_client.sh uninstall --purge   # и данные ~/sshtun то�
   - `excludes-as.txt` — автогенерация: префиксы автономных систем (команды `fetch-as` / `refresh`; не править руками);
   - `excludes-country.txt` — автогенерация: префиксы стран по ISO-кодам (`fetch-country` / `refresh`, данные ipdeny.com; не править руками);
   - `includes-force.txt` — принудительно «в туннель», приоритет над exclude-файлами;
-- команды: `add` / `del` (пользовательские исключения), `force-add` / `force-del` (force-список), `fetch-as AS... [--irr] [--remove AS...]`, `fetch-country CC... [--remove CC...]`, `refresh` (перекачка автогенных списков), `list` (показ эффективной политики);
+- команды: `exclude add` / `exclude del` (пользовательские исключения), `include add` / `include del` (force-список), `fetch-as AS... [--irr] [--remove AS...]`, `fetch-country CC... [--remove CC...]`, `refresh` (перекачка автогенных списков), `list` (показ эффективной политики); устаревшие `add`/`del`/`force-add`/`force-del` работают как алиасы с подсказкой миграции;
 - изменения применяются сразу, без перезапуска, если туннель поднят; массовые изменения (тысячи префиксов) идут одним netlink-батчем `ip -batch` (5000 маршрутов — ~0.2 с);
-- приоритет маршрутов: ядро выбирает самый длинный префикс (LPM); на равных префиксах force побеждает exclude.
+- приоритет маршрутов: ядро выбирает самый длинный префикс (LPM); на равных префиксах include побеждает exclude.
 
 После установки (`install_client.sh`) обёртка доступна как команда `sshtun`:
 
 ```bash
 sshtun up
-sshtun add 203.0.113.0/24
+sshtun exclude add 203.0.113.0/24
 sshtun fetch-as AS9009
 sshtun fetch-country ru
-sshtun force-add 198.51.100.7
+sshtun include add 198.51.100.7
 sshtun list
 ```
 

@@ -25,16 +25,20 @@ IFS=$'\n\t'
 #   status              состояние
 #   doctor              диагностика
 #   cleanup             убрать остатки после сбоев
-#   add CIDR...         добавить сети в исключения (direct, мимо туннеля)
-#   del CIDR...         убрать сети из пользовательских исключений
-#   force-add CIDR...   принудительно завернуть сети в туннель
-#   force-del CIDR...   убрать сети из force-списка
+#   exclude add CIDR... в исключения (direct, мимо туннеля)
+#   exclude del CIDR... убрать из пользовательских исключений
+#   include add CIDR... принудительно завернуть сети в туннель
+#   include del CIDR... убрать сети из force-списка
 #   fetch-as AS...      исключить префиксы AS (RIPEstat; --irr — через bgpq4;
 #                       --remove AS — убрать AS из списка)
 #   fetch-country CC... исключить префиксы стран (ipdeny.com, коды ISO;
 #                       --remove CC — убрать страну из списка)
 #   refresh             перекачать все автогенные списки
 #   list                показать эффективную маршрутную политику
+#
+# Устаревшие алиасы (работают, но подсказывают миграцию):
+#   add/del             = exclude add/del
+#   force-add/force-del = include add/del
 #
 # Запускать от обычного пользователя (sudo вызывается внутри).
 # ==========================================================
@@ -78,16 +82,18 @@ usage() {
   $0 status             состояние
   $0 doctor             диагностика
   $0 cleanup            очистка остатков
-  $0 add CIDR...        в исключения (напрямую, мимо туннеля)
-  $0 del CIDR...        убрать из пользовательских исключений
-  $0 force-add CIDR...  принудительно в туннель (даже если в exclude)
-  $0 force-del CIDR...  убрать из force-списка
+  $0 exclude add CIDR...    в исключения (напрямую, мимо туннеля)
+  $0 exclude del CIDR...    убрать из пользовательских исключений
+  $0 include add CIDR...    принудительно в туннель (даже если в exclude)
+  $0 include del CIDR...    убрать из include-списка
   $0 fetch-as AS... [--irr]   исключить префиксы AS (RIPEstat / bgpq4)
   $0 fetch-as --remove AS... убрать AS из автогенного списка
   $0 fetch-country CC...     исключить префиксы стран (ipdeny.com)
   $0 fetch-country --remove CC...  убрать страну из списка
   $0 refresh            перекачать все автогенные списки
   $0 list               показать маршрутную политику
+
+Устаревшие алиасы: add/del = exclude add/del; force-add/force-del = include add/del.
 
 Исключения (идут напрямую, мимо туннеля):
   $BASE_EXCLUDES
@@ -307,7 +313,7 @@ stop_vpn() {
 }
 
 add_excludes() {
-  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 add 203.0.113.0/24"
+  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 exclude add 203.0.113.0/24"
   mkdir -p "$EXCLUDES_DIR"
   touch "$CUSTOM_EXCLUDES"
 
@@ -326,7 +332,7 @@ add_excludes() {
 }
 
 del_excludes() {
-  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 del 203.0.113.0/24"
+  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 exclude del 203.0.113.0/24"
   mkdir -p "$EXCLUDES_DIR"
   touch "$CUSTOM_EXCLUDES"
 
@@ -349,7 +355,7 @@ del_excludes() {
 }
 
 force_add() {
-  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 force-add 203.0.113.0/24"
+  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 include add 203.0.113.0/24"
   mkdir -p "$EXCLUDES_DIR"
   touch "$FORCE_INCLUDES"
 
@@ -368,7 +374,7 @@ force_add() {
 }
 
 force_del() {
-  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 force-del 203.0.113.0/24"
+  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 include del 203.0.113.0/24"
   mkdir -p "$EXCLUDES_DIR"
   touch "$FORCE_INCLUDES"
 
@@ -690,6 +696,10 @@ list_policy() {
   echo "Приоритет: более длинный префикс побеждает всегда (LPM); на равных — force."
 }
 
+legacy_hint() {
+  log "Подсказка: синтаксис устарел — используйте: sshtun $1"
+}
+
 cmd="${1:-}"
 case "$cmd" in
   up|start)        shift; start_vpn "$@" ;;
@@ -698,10 +708,28 @@ case "$cmd" in
   status)          shift; check_client; sudo bash "$CLIENT_SCRIPT" status "$@" ;;
   doctor)          shift; check_client; sudo bash "$CLIENT_SCRIPT" doctor "$@" ;;
   cleanup)         shift; check_client; sudo bash "$CLIENT_SCRIPT" cleanup "$@" ;;
-  add)             shift; add_excludes "$@" ;;
-  del)             shift; del_excludes "$@" ;;
-  force-add)       shift; force_add "$@" ;;
-  force-del)       shift; force_del "$@" ;;
+  exclude)
+    shift
+    [[ $# -ge 1 ]] || die "Укажите подкоманду: $0 exclude add|del CIDR..."
+    sub="${1:-}"; shift
+    case "$sub" in
+      add|+)  add_excludes "$@" ;;
+      del|-)  del_excludes "$@" ;;
+      *) die "Неизвестная подкоманда: exclude $sub (нужно add|del)" ;;
+    esac ;;
+  include)
+    shift
+    [[ $# -ge 1 ]] || die "Укажите подкоманду: $0 include add|del CIDR..."
+    sub="${1:-}"; shift
+    case "$sub" in
+      add|+)  force_add "$@" ;;
+      del|-)  force_del "$@" ;;
+      *) die "Неизвестная подкоманда: include $sub (нужно add|del)" ;;
+    esac ;;
+  add)             shift; legacy_hint "exclude add CIDR..."; add_excludes "$@" ;;
+  del)             shift; legacy_hint "exclude del CIDR..."; del_excludes "$@" ;;
+  force-add)       shift; legacy_hint "include add CIDR..."; force_add "$@" ;;
+  force-del)       shift; legacy_hint "include del CIDR..."; force_del "$@" ;;
   fetch-as)        shift; fetch_as "$@" ;;
   fetch-country)   shift; fetch_country "$@" ;;
   refresh)         shift; refresh_lists "$@" ;;
