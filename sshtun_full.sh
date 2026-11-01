@@ -25,10 +25,12 @@ IFS=$'\n\t'
 #   status              состояние
 #   doctor              диагностика
 #   cleanup             убрать остатки после сбоев
-#   exclude add CIDR... в исключения (direct, мимо туннеля)
+#   exclude add CIDR... [-- комментарий]
+#                       в исключения (direct, мимо туннеля)
 #   exclude del CIDR... убрать из пользовательских исключений
-#   include add CIDR... принудительно завернуть сети в туннель
-#   include del CIDR... убрать сети из force-списка
+#   include add CIDR... [-- комментарий]
+#                       принудительно завернуть сети в туннель
+#   include del CIDR... убрать сети из include-списка
 #   fetch-as AS...      исключить префиксы AS (RIPEstat; --irr — через bgpq4;
 #                       --remove AS — убрать AS из списка)
 #   fetch-country CC... исключить префиксы стран (ipdeny.com, коды ISO;
@@ -82,9 +84,9 @@ usage() {
   $0 status             состояние
   $0 doctor             диагностика
   $0 cleanup            очистка остатков
-  $0 exclude add CIDR...    в исключения (напрямую, мимо туннеля)
+  $0 exclude add CIDR... [-- комментарий]    в исключения (напрямую, мимо туннеля)
   $0 exclude del CIDR...    убрать из пользовательских исключений
-  $0 include add CIDR...    принудительно в туннель (даже если в exclude)
+  $0 include add CIDR... [-- комментарий]    принудительно в туннель (даже если в exclude)
   $0 include del CIDR...    убрать из include-списка
   $0 fetch-as AS... [--irr]   исключить префиксы AS (RIPEstat / bgpq4)
   $0 fetch-as --remove AS... убрать AS из автогенного списка
@@ -157,6 +159,52 @@ normalize_cidr() {
   [[ "$cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] \
     || die "Не похоже на IPv4-подсеть/адрес: $1 (нужно вида 203.0.113.0/24)"
   printf '%s' "$cidr"
+}
+
+# Разобрать аргументы команд add/del: CIDR... [-- комментарий].
+# nameref: _cidrs (массив CIDR), _comment (строка, может быть пустой).
+parse_cidrs_comment() {
+  local -n _cidrs="$1"
+  local -n _comment="$2"
+  shift 2
+  _cidrs=()
+  _comment=""
+  local seen_ddash=0 arg=""
+  for arg in "$@"; do
+    if (( seen_ddash == 0 )) && [[ "$arg" == "--" ]]; then
+      seen_ddash=1
+      continue
+    fi
+    if (( seen_ddash == 1 )); then
+      _comment+="${_comment:+ }$arg"
+    else
+      _cidrs+=("$arg")
+    fi
+  done
+}
+
+# Есть ли CIDR в файле (сравнение по первому токену строки, комментарии
+# в строках вида "CIDR # комментарий" не мешают).
+cidr_line_exists() { # file cidr
+  awk -v c="$2" '{
+    line = $0
+    sub(/^[[:space:]]*/, "", line)
+    sub(/[[:space:]]*#.*/, "", line)
+    sub(/[[:space:]]*$/, "", line)
+    if (line == c) found = 1
+  } END { exit !found }' "$1"
+}
+
+# Вывести файл без строк, чей первый токен равен CIDR.
+remove_cidr_lines() { # file cidr
+  awk -v c="$2" '{
+    line = $0
+    sub(/^[[:space:]]*/, "", line)
+    sub(/[[:space:]]*#.*/, "", line)
+    sub(/[[:space:]]*$/, "", line)
+    if (line == c) next
+    print
+  }' "$1"
 }
 
 # Загрузить все exclude-CIDR из всех файлов в ассоциативный массив (по ссылке).
@@ -327,18 +375,34 @@ stop_vpn() {
 }
 
 add_excludes() {
-  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 exclude add 203.0.113.0/24"
+  local cidrs=() comment=""
+  parse_cidrs_comment cidrs comment "$@"
+  ((${#cidrs[@]} >= 1)) || die "Укажите хотя бы одну сеть/адрес: $0 exclude add 203.0.113.0/24"
   mkdir -p "$EXCLUDES_DIR"
   touch "$CUSTOM_EXCLUDES"
 
-  local cidr="" adds=()
-  for cidr in "$@"; do
+  local cidr="" adds=() tmp=""
+  for cidr in "${cidrs[@]}"; do
     cidr="$(normalize_cidr "$cidr")"
-    if grep -qxF "$cidr" "$CUSTOM_EXCLUDES"; then
-      log "Уже есть в списке: $cidr"
+    if cidr_line_exists "$CUSTOM_EXCLUDES" "$cidr"; then
+      if [[ -n "$comment" ]]; then
+        # обновить комментарий: переписать строку и перенести в конец
+        tmp="$(mktemp)"
+        remove_cidr_lines "$CUSTOM_EXCLUDES" "$cidr" > "$tmp"
+        mv -f "$tmp" "$CUSTOM_EXCLUDES"
+        printf '%s # %s\n' "$cidr" "$comment" >> "$CUSTOM_EXCLUDES"
+        log "Комментарий обновлён: $cidr # $comment"
+      else
+        log "Уже есть в списке: $cidr"
+      fi
     else
-      echo "$cidr" >> "$CUSTOM_EXCLUDES"
-      log "Записано в $CUSTOM_EXCLUDES: $cidr"
+      if [[ -n "$comment" ]]; then
+        printf '%s # %s\n' "$cidr" "$comment" >> "$CUSTOM_EXCLUDES"
+        log "Записано в $CUSTOM_EXCLUDES: $cidr # $comment"
+      else
+        printf '%s\n' "$cidr" >> "$CUSTOM_EXCLUDES"
+        log "Записано в $CUSTOM_EXCLUDES: $cidr"
+      fi
       adds+=("add $cidr")
     fi
   done
@@ -346,18 +410,18 @@ add_excludes() {
 }
 
 del_excludes() {
-  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 exclude del 203.0.113.0/24"
+  local cidrs=() comment=""
+  parse_cidrs_comment cidrs comment "$@"
+  ((${#cidrs[@]} >= 1)) || die "Укажите хотя бы одну сеть/адрес: $0 exclude del 203.0.113.0/24"
   mkdir -p "$EXCLUDES_DIR"
   touch "$CUSTOM_EXCLUDES"
 
-  local cidr="" dels=()
-  for cidr in "$@"; do
+  local cidr="" dels=() tmp=""
+  for cidr in "${cidrs[@]}"; do
     cidr="$(normalize_cidr "$cidr")"
-    if grep -qxF "$cidr" "$CUSTOM_EXCLUDES"; then
-      local tmp
+    if cidr_line_exists "$CUSTOM_EXCLUDES" "$cidr"; then
       tmp="$(mktemp)"
-      # || true: grep -vxF вернёт rc=1, когда удаляется единственная строка
-      grep -vxF "$cidr" "$CUSTOM_EXCLUDES" > "$tmp" || true
+      remove_cidr_lines "$CUSTOM_EXCLUDES" "$cidr" > "$tmp"
       mv -f "$tmp" "$CUSTOM_EXCLUDES"
       log "Удалено из $CUSTOM_EXCLUDES: $cidr"
       dels+=("del $cidr")
@@ -369,18 +433,33 @@ del_excludes() {
 }
 
 force_add() {
-  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 include add 203.0.113.0/24"
+  local cidrs=() comment=""
+  parse_cidrs_comment cidrs comment "$@"
+  ((${#cidrs[@]} >= 1)) || die "Укажите хотя бы одну сеть/адрес: $0 include add 203.0.113.0/24"
   mkdir -p "$EXCLUDES_DIR"
   touch "$FORCE_INCLUDES"
 
-  local cidr="" adds=()
-  for cidr in "$@"; do
+  local cidr="" adds=() tmp=""
+  for cidr in "${cidrs[@]}"; do
     cidr="$(normalize_cidr "$cidr")"
-    if grep -qxF "$cidr" "$FORCE_INCLUDES"; then
-      log "Уже есть в force-списке: $cidr"
+    if cidr_line_exists "$FORCE_INCLUDES" "$cidr"; then
+      if [[ -n "$comment" ]]; then
+        tmp="$(mktemp)"
+        remove_cidr_lines "$FORCE_INCLUDES" "$cidr" > "$tmp"
+        mv -f "$tmp" "$FORCE_INCLUDES"
+        printf '%s # %s\n' "$cidr" "$comment" >> "$FORCE_INCLUDES"
+        log "Комментарий обновлён: $cidr # $comment"
+      else
+        log "Уже есть в include-списке: $cidr"
+      fi
     else
-      echo "$cidr" >> "$FORCE_INCLUDES"
-      log "Записано в $FORCE_INCLUDES: $cidr"
+      if [[ -n "$comment" ]]; then
+        printf '%s # %s\n' "$cidr" "$comment" >> "$FORCE_INCLUDES"
+        log "Записано в $FORCE_INCLUDES: $cidr # $comment"
+      else
+        printf '%s\n' "$cidr" >> "$FORCE_INCLUDES"
+        log "Записано в $FORCE_INCLUDES: $cidr"
+      fi
       adds+=("add $cidr")
     fi
   done
@@ -388,18 +467,18 @@ force_add() {
 }
 
 force_del() {
-  [[ $# -ge 1 ]] || die "Укажите хотя бы одну сеть/адрес: $0 include del 203.0.113.0/24"
+  local cidrs=() comment=""
+  parse_cidrs_comment cidrs comment "$@"
+  ((${#cidrs[@]} >= 1)) || die "Укажите хотя бы одну сеть/адрес: $0 include del 203.0.113.0/24"
   mkdir -p "$EXCLUDES_DIR"
   touch "$FORCE_INCLUDES"
 
-  local cidr="" dels=()
-  for cidr in "$@"; do
+  local cidr="" dels=() tmp=""
+  for cidr in "${cidrs[@]}"; do
     cidr="$(normalize_cidr "$cidr")"
-    if grep -qxF "$cidr" "$FORCE_INCLUDES"; then
-      local tmp
+    if cidr_line_exists "$FORCE_INCLUDES" "$cidr"; then
       tmp="$(mktemp)"
-      # || true: grep -vxF вернёт rc=1, когда удаляется единственная строка
-      grep -vxF "$cidr" "$FORCE_INCLUDES" > "$tmp" || true
+      remove_cidr_lines "$FORCE_INCLUDES" "$cidr" > "$tmp"
       mv -f "$tmp" "$FORCE_INCLUDES"
       log "Удалено из $FORCE_INCLUDES: $cidr"
       dels+=("del $cidr")
@@ -707,6 +786,13 @@ refresh_lists() {
   fi
 }
 
+# Сырые содержательные строки файла (без чистых комментариев и пустых) —
+# для показа в list вместе с inline-комментариями "CIDR # текст".
+show_raw_entries() {
+  [[ -f "$1" ]] || return 0
+  sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$1"
+}
+
 list_policy() {
   local f="" title="" n=0 t=0
   echo "=== INCLUDE (принудительно В ТУННЕЛЬ; на равных префиксах побеждает exclude-ы):"
@@ -715,7 +801,7 @@ list_policy() {
   if [[ -f "$FORCE_INCLUDES" ]]; then
     n="$(list_entries "$FORCE_INCLUDES" | grep -c . || true)"
     if (( n > 0 )); then
-      list_entries "$FORCE_INCLUDES" | sed 's/^/      /'
+      show_raw_entries "$FORCE_INCLUDES" | sed 's/^/      /'
     else
       echo "      (пусто)"
     fi
@@ -743,7 +829,7 @@ list_policy() {
         printf '    %-18s %6s токен(ов) — развернуть: sshtun refresh (или up/restart)\n' "" "$t"
       fi
       if (( n > 0 && n <= 50 )); then
-        list_entries "$f" | sed 's/^/      /'
+        show_raw_entries "$f" | sed 's/^/      /'
       fi
     else
       case "$f" in
