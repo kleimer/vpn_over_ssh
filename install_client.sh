@@ -37,7 +37,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/sshtun_client}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 LINK_NAME="${LINK_NAME:-sshtun}"
 FILES=(sshtun_full.sh sshtun_pool_client.sh)
-TEMPLATES=(excludes.txt excludes-custom.txt excludes-as.txt excludes-country.txt)
+TEMPLATES=(excludes.txt excludes-custom.txt excludes-as.txt excludes-country.txt server.conf)
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 

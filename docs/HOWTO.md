@@ -23,6 +23,10 @@ cp -a ~/sshtun ~/sshtun.bak.$(date +%Y%m%d)
 sshtun status
 ```
 
+Адрес сервера задаётся локально (в коде и репозитории дефолта нет):
+в `~/sshtun/server.conf` (строка `SERVER_HOST=...`, файл создаёт
+установщик) или через env `SERVER_HOST=... sshtun up`.
+
 Если туннель не поднят: `sshtun up` (проверьте `curl -4 ifconfig.me` —
 должен показать IP сервера).
 
@@ -168,7 +172,7 @@ ip rule show | grep 2510        # ожидается 2 правила: 25100 -> 
 ip route                        # main чистая: default + connected, без префиксов
 ip route show table 200 | wc -l # ~11k: исключения direct + include via tun + LAN + bypass
 ip route show table 201         # 0.0.0.0/1 + 128.0.0.0/1 via tun
-ip route get 192.168.8.1        # LAN напрямую (table 200), не через tun
+ip route get <LAN_шлюз>        # LAN напрямую (table 200), не через tun
 ```
 
 Проверка полного цикла (down не оставляет следов):
@@ -300,7 +304,7 @@ time ip -force -batch /tmp/bt.txt
 
 ```bash
 sysctl net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control
-ping -c 30 -i 0.3 46.17.105.148        # до сервера снаружи — базовый джиттер линка
+ping -c 30 -i 0.3 <IP_СЕРВЕРА>        # до сервера снаружи — базовый джиттер линка
 ping -c 30 -i 0.3 8.8.8.8              # через туннель — сравнить после
 ```
 
@@ -321,7 +325,7 @@ sudo TCP_CONGESTION_CONTROL=bbr bash install_server.sh
 ### 7c. Замер эффекта
 
 ```bash
-ping -c 30 -i 0.3 46.17.105.148   # линк: mdev должен быть ~как был (BBR линк не чинит)
+ping -c 30 -i 0.3 <IP_СЕРВЕРА>   # линк: mdev должен быть ~как был (BBR линк не чинит)
 ping -c 30 -i 0.3 8.8.8.8         # туннель: mdev и max должны заметно упасть
 ```
 
