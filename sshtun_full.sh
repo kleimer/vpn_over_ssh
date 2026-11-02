@@ -496,6 +496,13 @@ start_vpn() {
   [[ -n "$SERVER_HOST" ]] || die "SERVER_HOST не задан. Укажите адрес сервера:
   - в файле $EXCLUDES_DIR/server.conf (строка SERVER_HOST=your-server), или
   - через env: SERVER_HOST=your-server sshtun up"
+  # Быстрый отказ, если туннель уже жив: клиент проверил бы это сам, но ПОСЛЕ
+  # ensure_autogen (перекачка списков) — а при restart-цикле службы против
+  # «сироты» каждая попытка тянула бы полный refresh. Здесь — до любых сетевых
+  # операций.
+  if tun_is_running; then
+    die "Туннель уже работает (SSH_PID из state жив). Остановите сначала: sshtun down"
+  fi
   check_client
   check_excludes
   check_key
