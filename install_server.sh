@@ -21,6 +21,13 @@ IFS=$'\n\t'
 #   - enables IPv4 forwarding
 #   - adds only MASQUERADE + minimal FORWARD rules
 #   - does NOT install the old large firewall chains/rate limits/private blocks
+#
+# Опционально: TCP_CONGESTION_CONTROL=bbr|cubic (env).
+#   По умолчанию (не задано/none) система НЕ трогается. bbr подходит для
+#   шумных/теряющих путей до клиентов (снимает RTO-спайки SSH-туннеля),
+#   но это sender-side алгоритм: эффект есть только когда включён на ОБОИХ
+#   концах внешнего TCP. Откат: TCP_CONGESTION_CONTROL=cubic + reinstall,
+#   либо вручную удалить /etc/sysctl.d/90-vpn-over-ssh-congestion.conf.
 # ==========================================================
 
 BASE_DIR="${BASE_DIR:-/opt/sshtun_pool}"
@@ -62,6 +69,36 @@ MAX_STARTUPS="${MAX_STARTUPS:-50:30:200}"
 
 log(){ echo "[$(date -Is)] $*"; }
 die(){ echo "[ERROR] $*" >&2; exit 1; }
+
+CC_SYSCTL_FILE="/etc/sysctl.d/90-vpn-over-ssh-congestion.conf"
+CC_MODULE_FILE="/etc/modules-load.d/vpn-over-ssh-tcp_bbr.conf"
+
+# Опциональный выбор алгоритма управления конгестией TCP (BBR/CUBIC/...).
+# По умолчанию систему не трогаем. bbr: дополнительно грузим модуль tcp_bbr
+# и добавляем его в автозагрузку; при выборе другого алгоритма файл
+# автозагрузки убираем. Значение применяется сразу (sysctl -p).
+setup_congestion_control() {
+  local cc="${TCP_CONGESTION_CONTROL:-}"
+  [[ -z "$cc" || "$cc" == "none" ]] && { log "TCP_CONGESTION_CONTROL не задан — системный алгоритм не трогаем"; return 0; }
+  cc="$(tr 'A-Z' 'a-z' <<<"$cc")"
+
+  if [[ "$cc" == "bbr" ]]; then
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx bbr; then
+      modprobe tcp_bbr 2>/dev/null || die "Модуль tcp_bbr недоступен (ядро без BBR?). Отказ: оставляем системный алгоритм."
+    fi
+    echo "tcp_bbr" > "$CC_MODULE_FILE"
+    log "Модуль tcp_bbr загружен и добавлен в автозагрузку: $CC_MODULE_FILE"
+  else
+    rm -f "$CC_MODULE_FILE"
+  fi
+
+  sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx "$cc" \
+    || die "Алгоритм '$cc' недоступен в ядре (доступны: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null))"
+
+  printf '# vpn_over_ssh: выбранный алгоритм управления конгестией TCP\n# (установлено install_server.sh; удалите файл для отката к системному дефолту)\nnet.ipv4.tcp_congestion_control=%s\n' "$cc" > "$CC_SYSCTL_FILE"
+  sysctl -p "$CC_SYSCTL_FILE" >/dev/null
+  log "net.ipv4.tcp_congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control) (файл: $CC_SYSCTL_FILE)"
+}
 
 install_deps() {
   local missing=0
@@ -348,6 +385,7 @@ chown root:root "$UNIT_FILE"
 chmod 644 "$UNIT_FILE"
 
 "$SSHD_BIN" -t -f "$SSHD_CONFIG"
+setup_congestion_control
 systemctl daemon-reload
 systemctl enable "$NETWORK_SERVICE_NAME.service" >/dev/null
 systemctl restart "$NETWORK_SERVICE_NAME.service"
@@ -380,6 +418,11 @@ echo
 echo "NAT:"
 echo "  MASQUERADE ${TUN_POOL_CIDR} -> ${WAN_IF}"
 echo
+if [[ -n "${TCP_CONGESTION_CONTROL:-}" && "${TCP_CONGESTION_CONTROL:-}" != "none" ]]; then
+  echo "TCP congestion control:"
+  echo "  net.ipv4.tcp_congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) (файл ${CC_SYSCTL_FILE})"
+  echo
+fi
 echo "Client:"
 echo "  sudo bash sshtun_pool_client.sh start --host SERVER_IP" --key your_privat_key
 echo

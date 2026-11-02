@@ -103,6 +103,12 @@ Linux-клиент. Поддерживает:
   штатный stop → exit 0);
 - `status`, `doctor`, `cleanup`.
 
+Опционально установщики (`install_server.sh`, `install_client.sh`) умеют
+выбирать алгоритм управления конгестией TCP машины (`TCP_CONGESTION_CONTROL=bbr|cubic`,
+по умолчанию система не трогается). BBR снимает RTO-спайки SSH-туннеля на
+шумных/теряющих путях — это sender-side алгоритм, полный эффект при включении
+на обоих концах. См. раздел 7 [`docs/HOWTO.md`](docs/HOWTO.md).
+
 ### `install_client.sh`
 
 Установщик Linux-клиента. Разделяет «репозиторий для разработки» и
@@ -114,8 +120,17 @@ Linux-клиент. Поддерживает:
 sudo bash install_client.sh install      # установить или обновить копию
 sudo bash install_client.sh update       # git pull + install
 sudo bash install_client.sh reinstall    # переустановка
-sudo bash install_client.sh uninstall    # убрать /opt и symlink (~/sshtun остаётся)
+sudo bash install_client.sh uninstall    # убрать /opt, symlink, юнит и sysctl-файл congestion control (~/sshtun остаётся)
 sudo bash install_client.sh uninstall --purge   # и данные ~/sshtun тоже
+```
+
+Опционально — выбор алгоритма управления конгестией TCP (`BBR`/`CUBIC`):
+по умолчанию установщик систему не трогает. Подробности и замеры: раздел 7
+[`docs/HOWTO.md`](docs/HOWTO.md).
+
+```bash
+sudo TCP_CONGESTION_CONTROL=bbr bash install_client.sh install    # включить BBR
+sudo TCP_CONGESTION_CONTROL=cubic bash install_client.sh install  # откат к CUBIC
 ```
 
 При первой установке создаёт `~/sshtun/` из шаблонов `examples/`
