@@ -39,7 +39,8 @@ tun200 -> server 10.250.1.145, client 10.250.1.146
 .
 ├── CHANGELOG.md
 ├── docs/
-│   └── HOWTO.md                — инструкция по тестированию клиента
+│   ├── HOWTO.md                — инструкция по тестированию клиента (Linux)
+│   └── HOWTO-macos.md          — спецификация порта под macOS (launchd, тест-матрица)
 ├── examples/                   — шаблоны файлов маршрутной политики
 │   ├── excludes.txt
 │   ├── excludes-custom.txt
