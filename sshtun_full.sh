@@ -55,7 +55,10 @@ IFS=$'\n\t'
 # ==========================================================
 
 # --- настройки (при необходимости меняются здесь или через env) ---
-SERVER_HOST="${SERVER_HOST:-dvb.snee.su}"
+# SERVER_HOST намеренно НЕ имеет дефолта в коде: реальный адрес сервера
+# задаётся локально — через env SERVER_HOST или файл ~/sshtun/server.conf
+# (создаётся установщиком из шаблона, в репозиторий не коммитится).
+SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-65523}"
 SSH_USER="${SSH_USER:-sshvpn}"
 KEY_FILE="${KEY_FILE:-$HOME/.ssh/sshtun_ed25519}"
@@ -75,6 +78,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd -P)"
 CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
 
 EXCLUDES_DIR="${EXCLUDES_DIR:-$HOME/sshtun}"
+# SERVER_HOST из локального конфиг-файла (env имеет приоритет).
+if [[ -z "$SERVER_HOST" && -f "$EXCLUDES_DIR/server.conf" ]]; then
+  SERVER_HOST="$(sed -n 's/^SERVER_HOST=//p' "$EXCLUDES_DIR/server.conf" 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+fi
 BASE_EXCLUDES="$EXCLUDES_DIR/excludes.txt"
 CUSTOM_EXCLUDES="$EXCLUDES_DIR/excludes-custom.txt"
 AS_EXCLUDES="$EXCLUDES_DIR/excludes-as.txt"
@@ -479,6 +486,9 @@ ensure_autogen() {
 start_vpn() {
   local foreground=0
   [[ "${1:-}" == "--foreground" ]] && foreground=1
+  [[ -n "$SERVER_HOST" ]] || die "SERVER_HOST не задан. Укажите адрес сервера:
+  - в файле $EXCLUDES_DIR/server.conf (строка SERVER_HOST=your-server), или
+  - через env: SERVER_HOST=your-server sshtun up"
   check_client
   check_excludes
   check_key
