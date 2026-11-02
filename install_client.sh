@@ -54,12 +54,16 @@ CC_MODULE_FILE="/etc/modules-load.d/vpn-over-ssh-tcp_bbr.conf"
 # Откат: TCP_CONGESTION_CONTROL=cubic + повторный install, либо uninstall.
 setup_congestion_control() {
   local cc="${TCP_CONGESTION_CONTROL:-}"
+  local avail=""
   [[ -z "$cc" || "$cc" == "none" ]] && { log "TCP_CONGESTION_CONTROL не задан — системный алгоритм не трогаем"; return 0; }
   cc="$(tr 'A-Z' 'a-z' <<<"$cc")"
 
   if [[ "$cc" == "bbr" ]]; then
-    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx bbr; then
+    avail=" $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) "
+    if [[ "$avail" != *" bbr "* ]]; then
       sudo -n modprobe tcp_bbr 2>/dev/null || die "Модуль tcp_bbr недоступен (ядро без BBR?). Отказ: системный алгоритм не изменён."
+      avail=" $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) "
+      [[ "$avail" == *" bbr "* ]] || die "Модуль tcp_bbr загрузился, но алгоритм не появился. Отказ: системный алгоритм не изменён."
     fi
     echo "tcp_bbr" | sudo -n tee "$CC_MODULE_FILE" >/dev/null
     log "Модуль tcp_bbr загружен и добавлен в автозагрузку: $CC_MODULE_FILE"
@@ -67,8 +71,11 @@ setup_congestion_control() {
     sudo -n rm -f "$CC_MODULE_FILE"
   fi
 
-  sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx "$cc" \
-    || die "Алгоритм '$cc' недоступен в ядре (доступны: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null))"
+  # проверка доступности: подстрока с границами слов, без grep -q в пайпе
+  # (ранний выход консьюмера + pipefail = SIGPIPE-ловушка)
+  avail=" $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) "
+  [[ "$avail" == *" $cc "* ]] \
+    || die "Алгоритм '$cc' недоступен в ядре (доступны:$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null))"
 
   printf '# vpn_over_ssh: выбранный алгоритм управления конгестией TCP\n# (установлено install_client.sh; удалите файл для отката к системному дефолту)\nnet.ipv4.tcp_congestion_control=%s\n' "$cc" | sudo -n tee "$CC_SYSCTL_FILE" >/dev/null
   sudo -n sysctl -p "$CC_SYSCTL_FILE" >/dev/null

@@ -180,10 +180,13 @@ list_entries() {
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' | sort -u
 }
 
-# Источники автогенного файла из его шапки (через пробел).
+# Источники автогенного файла из его шапки. Вывод sed читаем целиком до
+# awk: пайп 'sed | head' — SIGPIPE-ловушка под pipefail.
 managed_sources() {
   [[ -f "$1" ]] || return 0
-  sed -n 's/^# sshtun-managed-sources:[[:space:]]*//p' "$1" | head -n1
+  local out
+  out="$(sed -n 's/^# sshtun-managed-sources:[[:space:]]*//p' "$1")"
+  awk 'NR==1{print; exit}' <<<"$out"
 }
 
 # Нормализация аргумента в CIDR: адрес без префикса -> /32; валидация формата.
@@ -278,8 +281,9 @@ apply_direct_changes() {
   local table
   table="$(policy_table_direct_runtime)"
 
-  local default_route gw dev
-  default_route="$(ip -4 route show default | head -n1 || true)"
+  local default_route routes_out gw dev
+  routes_out="$(ip -4 route show default 2>/dev/null)" || true
+  default_route="$(awk 'NR==1{print; exit}' <<<"$routes_out")"
   gw="$(awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$default_route")"
   dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$default_route")"
   if [[ -z "$dev" ]]; then
@@ -459,8 +463,11 @@ migrate_legacy_inline() { # src_token_file dst_generated
 # иначе die). Источников нет: подхватим legacy-инлайн, если файл старого формата.
 ensure_autogen() {
   local need=0
-  if file_sources "$AS_EXCLUDES" | grep -q .; then need=1; fi
-  if file_sources "$COUNTRY_EXCLUDES" | grep -q .; then need=1; fi
+  local srcs=""
+  srcs="$(file_sources "$AS_EXCLUDES")"
+  [[ -n "$srcs" ]] && need=1
+  srcs="$(file_sources "$COUNTRY_EXCLUDES")"
+  [[ -n "$srcs" ]] && need=1
   if (( need == 0 )); then
     migrate_legacy_inline "$AS_EXCLUDES" "$AS_GENERATED"
     migrate_legacy_inline "$COUNTRY_EXCLUDES" "$COUNTRY_GENERATED"

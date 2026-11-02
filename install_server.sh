@@ -83,8 +83,12 @@ setup_congestion_control() {
   cc="$(tr 'A-Z' 'a-z' <<<"$cc")"
 
   if [[ "$cc" == "bbr" ]]; then
-    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx bbr; then
+    local avail
+    avail=" $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) "
+    if [[ "$avail" != *" bbr "* ]]; then
       modprobe tcp_bbr 2>/dev/null || die "Модуль tcp_bbr недоступен (ядро без BBR?). Отказ: оставляем системный алгоритм."
+      avail=" $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) "
+      [[ "$avail" == *" bbr "* ]] || die "Модуль tcp_bbr загрузился, но алгоритм не появился. Отказ: оставляем системный алгоритм."
     fi
     echo "tcp_bbr" > "$CC_MODULE_FILE"
     log "Модуль tcp_bbr загружен и добавлен в автозагрузку: $CC_MODULE_FILE"
@@ -92,8 +96,12 @@ setup_congestion_control() {
     rm -f "$CC_MODULE_FILE"
   fi
 
-  sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx "$cc" \
-    || die "Алгоритм '$cc' недоступен в ядре (доступны: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null))"
+  # проверка доступности: подстрока с границами слов, без grep -q в пайпе
+  # (ранний выход консьюмера + pipefail = SIGPIPE-ловушка)
+  local avail
+  avail=" $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) "
+  [[ "$avail" == *" $cc "* ]] \
+    || die "Алгоритм '$cc' недоступен в ядре (доступны:$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null))"
 
   printf '# vpn_over_ssh: выбранный алгоритм управления конгестией TCP\n# (установлено install_server.sh; удалите файл для отката к системному дефолту)\nnet.ipv4.tcp_congestion_control=%s\n' "$cc" > "$CC_SYSCTL_FILE"
   sysctl -p "$CC_SYSCTL_FILE" >/dev/null
@@ -120,8 +128,12 @@ install_deps() {
     die "Install manually: openssh-server iproute2 iptables procps openssl"
   fi
 }
-detect_wan_if(){ ip -4 route ls | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
-detect_wan_ip(){ local ifname="$1"; ip -4 -o addr show dev "$ifname" scope global | awk '{split($4,a,"/"); print a[1]; exit}'; }
+# ВАЖНО: вывод читаем в переменную ДО парсинга. Пайплайны вида
+# 'ip ... | awk/head' с ранним выходом консьюмера убивают producer SIGPIPE,
+# а pipefail+set -e превращают это в молчаливую смерть скрипта (на сервере
+# всплыло как exit 141 сразу после install_deps).
+detect_wan_if(){ local routes; routes="$(ip -4 route ls)"; awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$routes"; }
+detect_wan_ip(){ local ifname="$1" addrs; addrs="$(ip -4 -o addr show dev "$ifname" scope global)"; awk '{split($4,a,"/"); print a[1]; exit}' <<<"$addrs"; }
 
 sshd_supports_directive() {
   local directive="$1" tmp
@@ -271,7 +283,7 @@ WAN_IF_DEFAULT="$WAN_IF"
 
 log(){ echo "[\$(date -Is)] \$*"; }
 
-detect_wan_if(){ ip -4 route ls | awk '/default/ {for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}'; }
+detect_wan_if(){ local routes; routes="\$(ip -4 route ls)"; awk '/default/ {for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}' <<<"\$routes"; }
 
 iptables_del_all(){
   local table="\$1"; shift
