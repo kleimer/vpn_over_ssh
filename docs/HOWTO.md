@@ -44,9 +44,8 @@ ip route show 203.0.113.0/24               # ожидается: пусто (т�
 Повторный `exclude add` того же CIDR не дублирует строку; при повторе
 с `-- комментарием` комментарий обновляется. `exclude del` ищет по первому
 токену строки — удалит и строку с комментарием. Комментарии поддерживают
-и include-список. В автогенных файлах (`excludes-as.txt`,
-`excludes-country.txt`) комментарии не сохраняются — их перезаписывает
-`refresh`.
+и include-список, и файлы-токенов `excludes-as.txt` /
+`excludes-country.txt` (сохраняются между refresh).
 
 ## 2. Include-список: include add / del и приоритеты
 
@@ -81,6 +80,10 @@ sshtun include del 203.0.113.0/24
 
 > Тесты 3a–3c выполняйте в изолированном каталоге (EXCLUDES_DIR), чтобы не
 > ставить тысячи реальных маршрутов. Тест 3d — на живом туннеле с маленькой AS.
+>
+> Схема файлов: `excludes-as.txt` / `excludes-country.txt` — файлы-ИСТОЧНИКИ
+> (только токены `AS9009` / `ru`), префиксы разворачиваются в
+> `generated/excludes-as.txt` / `generated/excludes-country.txt`.
 
 ```bash
 TD=$(mktemp -d); cp ~/sshtun/excludes.txt ~/sshtun/excludes-custom.txt "$TD"
@@ -88,28 +91,30 @@ TD=$(mktemp -d); cp ~/sshtun/excludes.txt ~/sshtun/excludes-custom.txt "$TD"
 # 3a. базовый fetch и объединение источников
 EXCLUDES_DIR=$TD sshtun fetch-as AS62597        # небольшая AS, ~16-30 префиксов
 EXCLUDES_DIR=$TD sshtun fetch-as AS9009         # большая, ~3000-4500
-grep "managed-sources" "$TD/excludes-as.txt"    # ожидается: AS62597 AS9009
-head "$TD/excludes-as.txt"                      # шапка: автогенерация, дата, источник
+grep -v '^#' "$TD/excludes-as.txt" | grep .      # ожидается: только токены AS62597 + AS9009
+ls "$TD/generated/"                              # ожидается: excludes-as.txt (префиксы)
+grep -c '^[0-9]' "$TD/generated/excludes-as.txt" # ожидается: тысячи префиксов
 
 # 3b. страны
 EXCLUDES_DIR=$TD sshtun fetch-country ru de
-EXCLUDES_DIR=$TD sshtun list                    # сводка по всем файлам
+EXCLUDES_DIR=$TD sshtun list                    # сводка: токены + счётчики кэша
 
-# 3c. refresh перекачивает всё по шапкам; --remove убирает источники
+# 3c. refresh перекачивает всё по токенам; --remove убирает источники
 EXCLUDES_DIR=$TD sshtun refresh
 EXCLUDES_DIR=$TD sshtun fetch-as --remove AS9009
-grep "managed-sources" "$TD/excludes-as.txt"    # остался только AS62597
+grep -v '^#' "$TD/excludes-as.txt" | grep .      # остался только AS62597
 EXCLUDES_DIR=$TD sshtun fetch-as --remove AS62597
-ls "$TD"                                        # excludes-as.txt удалён совсем
+ls "$TD/excludes-as.txt" 2>&1                   # файла нет — удалён вместе с последним токеном
+ls "$TD/generated/"                             # excludes-as.txt тоже удалён
 EXCLUDES_DIR=$TD sshtun fetch-country --remove ru de   # аналогично
 rm -rf "$TD"
 
 # 3d. живое применение на работающем туннеле (маленькая AS, префиксы TEST-NET
 #     не используются — будет реальный трафик по этим маршрутам, это нормально)
 sshtun fetch-as AS62597
-ip route show | grep -c 'via 192.168'   # до
-sshtun fetch-as --remove AS62597        # дифф (в основном del) применится сразу
-ip route show | grep -c 'via 192.168'   # после: вернулось как было
+ip route show table 200 | wc -l   # до
+sshtun fetch-as --remove AS62597  # дифф (в основном del) применится сразу
+ip route show table 200 | wc -l   # после: вернулось как было
 ```
 
 Контроль скорости: применение диффа в тысячи маршрутов занимает доли
@@ -117,8 +122,8 @@ ip route show | grep -c 'via 192.168'   # после: вернулось как 
 
 ### 3e. Токены прямо в файлах (без команд fetch)
 
-В автогенные файлы можно вручную дописывать не только префиксы, но и
-источники — по одному на строку:
+Файлы-токены — это и есть список AS/стран, правится как обычный текст,
+по одному токену на строку:
 
 ```bash
 echo 'AS9009' >> ~/sshtun/excludes-as.txt      # номер AS (с буквами AS)
@@ -131,8 +136,15 @@ echo 'ru'    >> ~/sshtun/excludes-country.txt  # код страны, 2 букв
 
 Убрать токен: `sshtun fetch-as --remove AS9009` / `sshtun fetch-country
 --remove ru` — он исчезнет из файла и не появится снова при refresh.
-Важно: до развёртывания (пока в файле лежит токен) маршруты по нему не
-действуют — нужен `refresh` или `up`.
+Комментарии (`# ...`) в файлах-токенах сохраняются между refresh.
+
+### 3f. Офлайн-fallback (без сети)
+
+Если при `up` нет сети, а токены есть — туннель не падает, а поднимается
+на последнем кэше из `~/sshtun/generated/` (с предупреждением в логе).
+Проверка вручную не обязательна: просто имейте в виду, что кэш — это
+защита от старта офлайн, данные в нём могут быть устаревшими до ближайшего
+успешного `refresh`.
 
 ## 4. Рестарт и состояние
 
@@ -187,6 +199,65 @@ sudo bash install_client.sh update        # git pull + install
 `/opt/sshtun_client/sshtun_full.sh`; `sshtun list` работает (клиентский
 скрипт находится по symlink-разрешению).
 
+## 5a. Служба systemd: досмотр и автостарт
+
+После `install_client.sh install` юнит лежит в
+`/etc/systemd/system/sshtun.service`, **выключен**:
+
+```bash
+systemctl status sshtun            # inactive (dead) — норма
+sudo systemctl start sshtun        # туннель под досмотром
+systemctl status sshtun            # active (running): sshtun up --foreground
+sshtun status                      # туннель работает как обычно
+```
+
+Проверка досмотра (переживает «смерть» ssh):
+
+```bash
+sudo kill $(sudo bash -c 'source /run/sshtun/state; echo $SSH_PID')   # имитируем падение
+sleep 8                             # RestartSec=5 + время поднятия
+systemctl status sshtun             # снова active; N restarts в статистике юнита
+sshtun status                       # туннель поднялся, маршруты на месте
+```
+
+Остановки БЕЗ рестарта (проверить каждую):
+
+```bash
+sudo systemctl stop sshtun         # штатно, остаётся inactive
+sudo systemctl start sshtun
+sshtun down                        # штатно: служба видит ручную остановку и НЕ рестартит
+systemctl is-active sshtun         # inactive (dead) — без рестарта
+```
+
+Автостарт при загрузке (опционально, требуется ключ без passphrase):
+
+```bash
+sudo systemctl enable sshtun       # включить автостарт
+sudo systemctl disable sshtun      # выключить
+journalctl -u sshtun -f            # лог службы
+```
+
+> Ключ с passphrase в службе работать не будет (SSH BatchMode) — для
+> службы используйте ключ без пароля, либо не пользуйтесь службой и
+> поднимайте туннель вручную `sshtun up` как раньше.
+
+> Миграция данных: старые `excludes-as.txt`/`excludes-country.txt` с
+> инлайн-префиксами (до этой версии) подхватываются автоматически —
+> источники берутся из шапки, префиксы переносятся в `generated/`
+> (офлайн-миграция, если нет сети). Первый же `refresh` перекачает их.
+
+## 5b. Файлы-токены: что где лежит (после обновления)
+
+```bash
+cat ~/sshtun/excludes-as.txt        # только токены: AS62597, AS9009...
+cat ~/sshtun/excludes-country.txt   # только токены: ru...
+ls ~/sshtun/generated/              # развёрнутые префиксы (не править)
+sshtun list                         # сводка: токены + счётчики префиксов кэша
+```
+
+Добавление AS/страны — либо командами (`fetch-as`/`fetch-country`), либо
+строкой-токеном прямо в файл (развернётся при `refresh`/`up`).
+
 ## 6. Производительность батча (изолированный тест ядра)
 
 Не трогает main-таблицу (отдельная таблица 100):
@@ -211,8 +282,10 @@ time ip -force -batch /tmp/bt.txt
 - [ ] `include add` побеждает exclude на равном префиксе; LPM-семантика (2c) верна
 - [ ] policy routing: правила 25100/25110 есть при работе, нет после `down`; main чистая (4a)
 - [ ] `restart`/`down`/`up` быстрые (~3 с / <1 с / ~3 с даже со списком страны)
-- [ ] `fetch-as`/`fetch-country`/`refresh` корректно объединяют и убирают источники
+- [ ] `fetch-as`/`fetch-country`/`refresh` корректно объединяют и убирают источники; файлы-токены содержат только токены, префиксы — в `generated/` (3a–3c)
+- [ ] при `up` без сети туннель поднимается на кэше из `generated/` (3f)
 - [ ] дифф в тысячи маршрутов применяется < 1 с
 - [ ] `restart` подхватывает все файлы, `status`/`doctor` без ошибок
-- [ ] `install`/`uninstall`/`reinstall`/`update` работают, данные не теряются
+- [ ] служба: падение ssh → рестарт через ~5 с; `systemctl stop` и `sshtun down` → без рестарта (5a)
+- [ ] `install`/`uninstall`/`reinstall`/`update` работают, юнит ставится выключенным, данные не теряются
 - [ ] `~/sshtun` восстановлен из бэкапа или оставлен в осознанном состоянии

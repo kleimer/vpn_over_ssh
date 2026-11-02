@@ -18,6 +18,9 @@ IFS=$'\n\t'
 #   - supports passphrase-protected keys via existing ssh-agent or temporary ssh-agent
 #   - preserves /run/sshtun/ssh.last.log after failed starts
 #   - stops retrying tun pool on deterministic SSH auth/port failures
+#   - --foreground: после старта не выходить, а досматривать ssh-процесс
+#     (режим для systemd: неожиданная смерть ssh -> cleanup + exit 1 ->
+#     Restart=on-failure; штатный stop/down -> exit 0 без рестарта)
 #
 # Server assumptions:
 #   user: sshvpn
@@ -56,6 +59,8 @@ TEMP_AGENT_PID=""
 # 1 = always enable, 0 = never enable.
 REMOTE_SETUP="${REMOTE_SETUP:-auto}"
 REMOTE_WAN_DEV="${REMOTE_WAN_DEV:-}"
+# --foreground: держать процесс в живых после старта и досматривать ssh.
+FOREGROUND="${FOREGROUND:-0}"
 
 # Safety guard for cleanup: delete only tunNNN with N>=100 and IP from 10.250.0.0/16.
 OWNED_TUN_MIN="${OWNED_TUN_MIN:-100}"
@@ -130,6 +135,8 @@ Start options:
   --remote-setup           configure remote tun/NAT inside SSH session; useful for --user root
   --no-remote-setup        do not configure remote tun/NAT; useful if server already has pool setup
   --remote-wan-dev DEV     server WAN interface for NAT; default: auto-detect default route dev
+  --foreground             do not exit after start: supervise the ssh process (systemd mode).
+                           ssh died unexpectedly -> cleanup + exit 1; 'stop'/SIGTERM -> exit 0
 
 Commands:
   stop                     stop current VPN from state and clean traces
@@ -213,6 +220,7 @@ parse_start_args() {
       --remote-setup) REMOTE_SETUP=1; shift ;;
       --no-remote-setup) REMOTE_SETUP=0; shift ;;
       --remote-wan-dev) REMOTE_WAN_DEV="${2:-}"; shift 2 ;;
+      --foreground) FOREGROUND=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unknown option for start: $1" ;;
     esac
@@ -997,6 +1005,53 @@ configure_client_routes() {
   write_state
 }
 
+# Режим --foreground (systemd): досматривать ssh-процесс.
+# - ssh умер сам (сон/сеть) -> cleanup + exit 1 (systemd: Restart=on-failure)
+# - state-файл исчез -> штатный 'sshtun down' снаружи -> exit 0 без рестарта
+# - SIGTERM/SIGINT (systemctl stop) -> cleanup + exit 0
+supervise_vpn() {
+  log "Supervising ssh process (foreground mode)"
+  trap 'supervisor_on_signal' TERM INT
+  wait "$SSH_PID" 2>/dev/null || true
+  SSH_PID=""
+
+  if [[ -f "$STATE_FILE" ]]; then
+    # Гонка: внешний stop_vpn убивает ssh, а rm state делает ПОСЛЕ cleanup —
+    # подождем до 5 с, исчезнет ли state (штатная остановка), прежде чем
+    # объявлять падение (exit 1 -> systemd перезапустит туннель).
+    for _ in $(seq 1 50); do
+      [[ -f "$STATE_FILE" ]] || break
+      sleep 0.1
+    done
+  fi
+  trap - TERM INT
+
+  if [[ ! -f "$STATE_FILE" ]]; then
+    # stop_vpn уже всё почистил и удалил state — считаем остановку штатной.
+    log "State removed externally — intentional stop, exiting cleanly"
+    exit 0
+  fi
+
+  log "ssh process died unexpectedly — cleaning up and exiting with failure"
+  cleanup_routes "${TUN_DEV:-}" "${SERVER_REAL_IP:-}" "$HAD_IPV6_BLACKHOLE"
+  [[ -n "${TUN_DEV:-}" ]] && ip link del "$TUN_DEV" 2>/dev/null || true
+  preserve_ssh_log
+  rm -f "$STATE_FILE"
+  exit 1
+}
+
+supervisor_on_signal() {
+  trap - TERM INT EXIT ERR
+  log "Stop signal received — shutting down tunnel"
+  kill_pid_safe "${SSH_PID:-}"
+  SSH_PID=""
+  cleanup_routes "${TUN_DEV:-}" "${SERVER_REAL_IP:-}" "$HAD_IPV6_BLACKHOLE"
+  [[ -n "${TUN_DEV:-}" ]] && ip link del "$TUN_DEV" 2>/dev/null || true
+  preserve_ssh_log
+  rm -f "$STATE_FILE" "$SSH_LOG" "$KNOWN_HOSTS_FILE"
+  exit 0
+}
+
 start_vpn() {
   need_root
   need_cmds
@@ -1071,6 +1126,14 @@ start_vpn() {
   START_OK="1"
   cleanup_temp_agent
   trap - EXIT INT TERM ERR
+
+  # Блокировку отпускаем ДО supervise: иначе 'sshtun down' никогда не
+  # получит flock (супервизор держал бы её бесконечно). Повторный старт
+  # безопасен без блокировки: state_pid_alive гасит его раньше конфигурации.
+  if [[ "$FOREGROUND" == "1" ]]; then
+    flock -u 9 2>/dev/null || true
+    supervise_vpn
+  fi
 
   log "Connected"
   echo

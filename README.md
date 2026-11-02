@@ -42,7 +42,9 @@ tun200 -> server 10.250.1.145, client 10.250.1.146
 │   └── HOWTO.md                — инструкция по тестированию клиента
 ├── examples/                   — шаблоны файлов маршрутной политики
 │   ├── excludes.txt
-│   └── excludes-custom.txt
+│   ├── excludes-custom.txt
+│   ├── excludes-as.txt
+│   └── excludes-country.txt
 ├── install_client.sh           — установка/удаление/обновление Linux-клиента
 ├── install_server.sh
 ├── sshtun_full.sh
@@ -95,6 +97,9 @@ Linux-клиент. Поддерживает:
 - lock от параллельных стартов/остановок;
 - cleanup старых управляемых `tunN`;
 - работу с passphrase-protected ключами через `ssh-agent` или `--ask-passphrase`;
+- режим `--foreground`: после старта процесс не выходит, а досматривает ssh —
+  основа для systemd-службы (падение ssh → cleanup + exit 1 → рестарт;
+  штатный stop → exit 0);
 - `status`, `doctor`, `cleanup`.
 
 ### `install_client.sh`
@@ -113,7 +118,20 @@ sudo bash install_client.sh uninstall --purge   # и данные ~/sshtun то�
 ```
 
 При первой установке создаёт `~/sshtun/` из шаблонов `examples/`
-(существующие файлы не трогает). Проверка и сценарии: [`docs/HOWTO.md`](docs/HOWTO.md).
+(существующие файлы не трогает). Также ставит systemd-юнит
+`/etc/systemd/system/sshtun.service` **выключенным** — досмотр туннеля с
+перезапуском при падении (сон/пропадание сети) и опциональный автостарт при
+загрузке:
+
+```bash
+systemctl start sshtun     # туннель под досмотром systemd
+systemctl stop sshtun      # штатная остановка (без рестарта)
+systemctl enable sshtun    # автостарт при загрузке ПК
+journalctl -u sshtun -f    # лог
+```
+
+Для службы ключ должен быть без passphrase (SSH BatchMode). Проверка и
+сценарии: [`docs/HOWTO.md`](docs/HOWTO.md).
 
 ### `sshtun_full.sh`
 
@@ -123,11 +141,12 @@ sudo bash install_client.sh uninstall --purge   # и данные ~/sshtun то�
 - файлы маршрутной политики в `~/sshtun/`:
   - `excludes.txt` — базовые исключения (RFC1918 и админские сети), трафик идёт напрямую;
   - `excludes-custom.txt` — пополняемый пользователем список исключений;
-  - `excludes-as.txt` — автогенерация: префиксы автономных систем (команды `fetch-as` / `refresh`; не править руками);
-  - `excludes-country.txt` — автогенерация: префиксы стран по ISO-кодам (`fetch-country` / `refresh`, данные ipdeny.com; не править руками);
+  - `excludes-as.txt` — источники-токены автономных систем (`AS9009`), по одному на строку; править руками или `fetch-as`;
+  - `excludes-country.txt` — источники-токены стран по ISO-кодам (`ru`), править руками или `fetch-country`;
+  - `generated/excludes-as.txt`, `generated/excludes-country.txt` — автоген: развёрнутые префиксы источников (не править; обновляются `refresh`/`up`, при отсутствии сети используется последний кэш);
   - `includes-force.txt` — принудительно «в туннель», приоритет над exclude-файлами;
 - команды: `exclude add` / `exclude del` (пользовательские исключения), `include add` / `include del` (force-список) — обе пары принимают `-- комментарий`, он сохраняется в файле и виден в `list`; `fetch-as AS... [--irr] [--remove AS...]`, `fetch-country CC... [--remove CC...]`, `refresh` (перекачка автогенных списков), `list` (показ эффективной политики); устаревшие `add`/`del`/`force-add`/`force-del` работают как алиасы с подсказкой миграции;
-- в автогенные файлы можно вручную дописывать токены-источники (`AS9009`, `ru`) — разворачиваются в префиксы командой `refresh` или автоматически при `up`;
+- файлы-токены `excludes-as.txt` / `excludes-country.txt` — это и есть «список AS/стран»: дописывай токены (`AS9009`, `ru`) напрямую в файл или командами fetch — развёртывание в префиксы происходит при `refresh` и автоматически при `up`; пользовательские комментарии в этих файлах сохраняются;
 - изменения применяются сразу, без перезапуска, если туннель поднят; массовые изменения (тысячи префиксов) идут одним netlink-батчем `ip -batch` (5000 маршрутов — ~0.2 с);
 - приоритет маршрутов: ядро выбирает самый длинный префикс (LPM); на равных префиксах include побеждает exclude.
 

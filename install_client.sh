@@ -8,14 +8,17 @@
 #   - создаёт symlink BIN_DIR/sshtun -> INSTALL_DIR/sshtun_full.sh
 #     (по умолчанию /usr/local/bin/sshtun);
 #   - если у вызывающего пользователя ещё нет ~/sshtun/, создаёт его
-#     из шаблонов examples/ (существующие файлы не трогает).
+#     из шаблонов examples/ (существующие файлы не трогает);
+#   - ставит systemd-юнит /etc/systemd/system/sshtun.service (ВЫКЛЮЧЕННЫЙ):
+#     управление — systemctl start/stop/status sshtun, автостарт при загрузке —
+#     systemctl enable sshtun. Требование: ключ без passphrase.
 #
 # Данные (~/sshtun, ключи) установка не затирает.
 #
 # Команды:
 #   install            установить (или обновить установленную копию)
 #   update             git pull в репозитории + install
-#   uninstall          убрать symlink и INSTALL_DIR (данные ~/sshtun остаются)
+#   uninstall          убрать symlink, INSTALL_DIR и systemd-юнит (данные ~/sshtun остаются)
 #   uninstall --purge  то же + удалить ~/sshtun вызывающего пользователя
 #   reinstall          uninstall + install
 #
@@ -28,7 +31,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/sshtun_client}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 LINK_NAME="${LINK_NAME:-sshtun}"
 FILES=(sshtun_full.sh sshtun_pool_client.sh)
-TEMPLATES=(excludes.txt excludes-custom.txt)
+TEMPLATES=(excludes.txt excludes-custom.txt excludes-as.txt excludes-country.txt)
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 
@@ -69,6 +72,51 @@ seed_user_files() {
   done
 }
 
+# systemd-юнит: досмотр туннеля (Restart=on-failure), опциональный автостарт.
+# Ставится ВЫКЛЮЧЕННЫМ; пути подставляются под домашний каталог установившего.
+install_service_unit() {
+  local u="" home=""
+  u="$(invoking_user)" || { log "systemd-юнит не создан (нет не-root пользователя)"; return 0; }
+  home="$(getent passwd "$u" | cut -d: -f6)"
+  [[ -n "$home" && -d "$home" ]] || { log "systemd-юнит не создан (не найден домашний каталог $u)"; return 0; }
+  command -v systemctl >/dev/null 2>&1 || { log "systemctl не найден — юнит не создан"; return 0; }
+
+  cat > /etc/systemd/system/sshtun.service <<EOF
+[Unit]
+Description=SSH-TUN VPN client (vpn_over_ssh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Пути под установившего пользователя (обёртка читает их из env):
+Environment=EXCLUDES_DIR=$home/sshtun
+Environment=KEY_FILE=$home/.ssh/sshtun_ed25519
+ExecStart=$BIN_DIR/$LINK_NAME up --foreground
+# Туннель упал (сон/сеть) -> код 1 -> рестарт. Штатный stop/down -> код 0 -> без рестарта.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  log "systemd-юнит установлен: /etc/systemd/system/sshtun.service (выключен)"
+  log "Управление: systemctl start|stop|status sshtun"
+  log "Автостарт при загрузке: systemctl enable sshtun (требуется ключ без passphrase)"
+}
+
+remove_service_unit() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  if [[ -f /etc/systemd/system/sshtun.service ]]; then
+    systemctl disable --now sshtun >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/sshtun.service
+    systemctl daemon-reload
+    log "Удалён systemd-юнит: /etc/systemd/system/sshtun.service"
+  fi
+}
+
 cmd_install() {
   ensure_root "$@"
   local f=""
@@ -87,6 +135,7 @@ cmd_install() {
   log "Ссылка: $BIN_DIR/$LINK_NAME -> $INSTALL_DIR/sshtun_full.sh"
 
   seed_user_files
+  install_service_unit
 
   echo
   log "Готово. Команды:"
@@ -94,6 +143,7 @@ cmd_install() {
   echo "  $LINK_NAME status          состояние"
   echo "  $LINK_NAME list            маршрутная политика"
   echo "  $LINK_NAME --help          все команды"
+  echo "  systemctl start sshtun     туннель под досмотром systemd (рестарт при падении)"
   echo
   log "Файлы маршрутной политики: ~/sshtun/ (excludes.txt, excludes-custom.txt)"
   log "Перед первым 'up' убедитесь, что ключ ~/.ssh/sshtun_ed25519 создан и"
@@ -121,6 +171,7 @@ cmd_uninstall() {
   log "Удалена ссылка: $BIN_DIR/$LINK_NAME"
   rm -rf "$INSTALL_DIR"
   log "Удалён каталог: $INSTALL_DIR"
+  remove_service_unit
 
   if (( purge )); then
     local u="" home=""
