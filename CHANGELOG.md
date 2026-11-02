@@ -2,6 +2,25 @@
 
 Здесь фиксируются суть и причины изменений проекта. Новые записи — сверху.
 
+## 2026-11-02 (хотфикс: SIGPIPE под pipefail)
+
+### Исправлено
+
+- **Молчаливое падение установщиков и клиента с exit 141 (SIGPIPE).**
+  Суть: паттерны `ip ... | awk '{exit}'`, `ip ... | head -n1`,
+  `getent | awk '{exit}'`, `sysctl | grep -q` — консьюмер завершается раньше,
+  чем producer допишет вывод, producer получает SIGPIPE, а `pipefail` +
+  `set -e` превращают это в мгновенную смерть скрипта без диагностики.
+  На сервере проявилось как обрыв `install_server.sh` сразу после
+  `Dependencies OK` (exit=141). Правка везде: вывод читается в переменную
+  целиком, разбор — через herestring; проверки наличия алгоритма в ядре —
+  подстрокой с границами слов вместо `grep -qx` в пайпе.
+  Затронуты: install_server.sh (detect_wan_if/detect_wan_ip + проверка bbr),
+  install_client.sh (setup_congestion_control), sshtun_full.sh
+  (managed_sources, ensure_autogen, runtime-применение маршрутов),
+  sshtun_pool_client.sh (resolve_server_ipv4, detect_default_route,
+  install_lan_route, legacy-дочистка 0.0.0.0/1).
+
 ## 2026-11-02 (хотфикс после релиза v1.4)
 
 ### Изменено

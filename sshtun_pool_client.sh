@@ -284,12 +284,20 @@ calc_pair_ips() {
   CLIENT_TUN_IP="${TUN_NET_A}.${TUN_NET_B}.${oct3}.$((oct4 + 2))"
 }
 
+# Резолвим в переменную целиком до awk: 'getent | awk{exit}' — ранний выход
+# консьюмера убивает пайплайн SIGPIPE под pipefail.
 resolve_server_ipv4() {
-  getent ahostsv4 "$HOST" | awk '{print $1; exit}'
+  local hosts=""
+  hosts="$(getent ahostsv4 "$HOST" 2>/dev/null)" || true
+  awk '{print $1; exit}' <<<"$hosts"
 }
 
+# Вывод ip читаем в переменную до разбора: пайп 'ip | head -n1' — SIGPIPE-
+# ловушка под pipefail (консьюмер выходит раньше, чем ip допишет таблицу).
 detect_default_route() {
-  DEFAULT_ROUTE="$(ip -4 route show default | head -n1 || true)"
+  local routes=""
+  routes="$(ip -4 route show default 2>/dev/null)" || true
+  DEFAULT_ROUTE="$(awk 'NR==1{print; exit}' <<<"$routes")"
   DEFAULT_GW="$(awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$DEFAULT_ROUTE")"
   DEFAULT_DEV="$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$DEFAULT_ROUTE")"
   [[ -n "$DEFAULT_DEV" ]] || die "Cannot detect default route device"
@@ -320,8 +328,9 @@ remove_policy_rules() {
 # Без неё LAN-трафик (роутер, принтеры, 192.168.x.x) ушёл бы в туннель:
 # правила 25100/25110 перекрывают main-таблицу, где живёт connected-маршрут.
 install_lan_route() {
-  local lan=""
-  lan="$(ip -4 route show dev "$DEFAULT_DEV" scope link proto kernel | head -n1)"
+  local routes="" lan=""
+  routes="$(ip -4 route show dev "$DEFAULT_DEV" scope link proto kernel 2>/dev/null)" || true
+  lan="$(awk 'NR==1{print; exit}' <<<"$routes")"
   [[ -n "$lan" ]] || return 0
   local prefix=""
   prefix="${lan%% *}"
@@ -547,8 +556,8 @@ cleanup_routes() {
   # маршруты в main. Только для таких (state без маркера POLICY_ROUTES)
   # дочищаем main построчно; у новых схема снимается flush'ем таблиц выше.
   if [[ "${POLICY_ROUTES:-0}" != "1" ]]; then
-    while ip -4 route show 0.0.0.0/1 2>/dev/null | grep -q .; do ip route del 0.0.0.0/1 2>/dev/null || break; done
-    while ip -4 route show 128.0.0.0/1 2>/dev/null | grep -q .; do ip route del 128.0.0.0/1 2>/dev/null || break; done
+    while [[ -n "$(ip -4 route show 0.0.0.0/1 2>/dev/null)" ]]; do ip route del 0.0.0.0/1 2>/dev/null || break; done
+    while [[ -n "$(ip -4 route show 128.0.0.0/1 2>/dev/null)" ]]; do ip route del 128.0.0.0/1 2>/dev/null || break; done
     if [[ -n "${ROUTES_VIA_TUN[*]:-}" ]]; then
       apply_route_list del main "${ROUTES_VIA_TUN[@]:-}"
     fi
