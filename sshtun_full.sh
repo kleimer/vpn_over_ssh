@@ -9,17 +9,21 @@ IFS=$'\n\t'
 # кроме сетей из файлов исключений (они идут напрямую).
 #
 # Файлы маршрутной политики (каталог ~/sshtun):
-#   excludes.txt         — базовые исключения (RFC1918 + админские сети)
-#   excludes-custom.txt  — ваш пополняемый список исключений
-#   excludes-as.txt      — АВТОГЕН: префиксы AS (команды fetch-as / refresh)
-#   excludes-country.txt — АВТОГЕН: префиксы стран (fetch-country / refresh)
-#   includes-force.txt   — принудительно В ТУННЕЛЬ (приоритет над excludes)
+#   excludes.txt           — базовые исключения (RFC1918 + админские сети)
+#   excludes-custom.txt    — ваш пополняемый список исключений
+#   excludes-as.txt        — ИСТОЧНИКИ: токены AS (AS9009), по одному на строку
+#   excludes-country.txt   — ИСТОЧНИКИ: токены стран (ru, de, us)
+#   includes-force.txt     — принудительно В ТУННЕЛЬ (приоритет над excludes)
+#   generated/             — АВТОГЕН: развёрнутые префиксы AS/стран (не править;
+#                            обновляются 'sshtun refresh' / автоматически при 'up')
 #
 # Приоритет: ядро выбирает по длине префикса (LPM) — более точный префикс
 # побеждает независимо от файла. На равных префиксах побеждает force-файл.
 #
 # Команды:
 #   up | start          поднять туннель
+#   up --foreground     поднять и не выходить (режим systemd: досмотр ssh,
+#                       при падении — exit 1 для Restart=on-failure)
 #   down | stop         остановить
 #   restart             переподнять
 #   status              состояние
@@ -32,11 +36,16 @@ IFS=$'\n\t'
 #                       принудительно завернуть сети в туннель
 #   include del CIDR... убрать сети из include-списка
 #   fetch-as AS...      исключить префиксы AS (RIPEstat; --irr — через bgpq4;
-#                       --remove AS — убрать AS из списка)
+#                       --remove AS — убрать AS из списка). Токены — в
+#                       excludes-as.txt, префиксы — в generated/excludes-as.txt
 #   fetch-country CC... исключить префиксы стран (ipdeny.com, коды ISO;
 #                       --remove CC — убрать страну из списка)
 #   refresh             перекачать все автогенные списки
 #   list                показать эффективную маршрутную политику
+#
+# Файлы AS/стран — источники-токены (править руками или командами выше);
+# развёрнутые префиксы кладутся в ~/sshtun/generated/ и там же кэшируются
+# между обновлениями (при отсутствии сети 'up' использует кэш).
 #
 # Устаревшие алиасы (работают, но подсказывают миграцию):
 #   add/del             = exclude add/del
@@ -71,12 +80,29 @@ CUSTOM_EXCLUDES="$EXCLUDES_DIR/excludes-custom.txt"
 AS_EXCLUDES="$EXCLUDES_DIR/excludes-as.txt"
 COUNTRY_EXCLUDES="$EXCLUDES_DIR/excludes-country.txt"
 FORCE_INCLUDES="$EXCLUDES_DIR/includes-force.txt"
+# Развёрнутые префиксы источников — отдельно от файлов-токенов: токены правят
+# руками/командами, префиксы скачиваются и лежат в generated/ (клиент читает их).
+GENERATED_DIR="${GENERATED_DIR:-$EXCLUDES_DIR/generated}"
+AS_GENERATED="$GENERATED_DIR/excludes-as.txt"
+COUNTRY_GENERATED="$GENERATED_DIR/excludes-country.txt"
 
 # Таблицы policy routing — должны совпадать с клиентом (он пишет их в state).
 POLICY_TABLE_DIRECT="${POLICY_TABLE_DIRECT:-200}"
 
-log(){ echo "[$(date -Is)] $*"; }
-die(){ echo "[ERROR] $*" >&2; exit 1; }
+log(){ echo "[$(date -Is)] $*" 2>/dev/null || true; }
+die(){ echo "[ERROR] $*" >&2 || true; exit 1; }
+
+# Под systemd обёртка работает от root, а файлы данных должен править
+# пользователь — возвращаем владельцу ~/sshtun и читаемые права (работает
+# и для generated/: ссылка — всегда на каталог данных, не на родителя).
+restore_owner() { # path
+  chown --reference="$EXCLUDES_DIR" "$1" 2>/dev/null || true
+  if [[ -d "$1" ]]; then
+    chmod 0755 "$1" 2>/dev/null || true
+  else
+    chmod 0644 "$1" 2>/dev/null || true
+  fi
+}
 
 usage() {
   cat <<EOFUSAGE
@@ -103,8 +129,8 @@ usage() {
 Исключения (идут напрямую, мимо туннеля):
   $BASE_EXCLUDES
   $CUSTOM_EXCLUDES
-  $AS_EXCLUDES        (автоген, если создан через fetch-as)
-  $COUNTRY_EXCLUDES   (автоген, если создан через fetch-country)
+  $AS_EXCLUDES        (токены AS; префиксы разворачиваются в $AS_GENERATED)
+  $COUNTRY_EXCLUDES   (токены стран; префиксы — в $COUNTRY_GENERATED)
 
 Принудительно в туннель (приоритет на равных префиксах):
   $FORCE_INCLUDES
@@ -213,10 +239,11 @@ remove_cidr_lines() { # file cidr
 # Загрузить все exclude-CIDR из всех файлов в ассоциативный массив (по ссылке).
 # Один проход по файлам вместо fork-grep на каждый CIDR: для диффов
 # в тысячи строк это разница между 0.3 с и минутами.
+# Для AS/стран берём generated/-кэш: файлы-токены префиксов не содержат.
 load_exclude_set() {
   local -n _out="$1"
   local f="" e=""
-  for f in "$BASE_EXCLUDES" "$CUSTOM_EXCLUDES" "$AS_EXCLUDES" "$COUNTRY_EXCLUDES"; do
+  for f in "$BASE_EXCLUDES" "$CUSTOM_EXCLUDES" "$AS_GENERATED" "$COUNTRY_GENERATED"; do
     [[ -f "$f" ]] || continue
     while IFS= read -r e; do
       [[ -n "$e" ]] && _out["$e"]=1
@@ -349,24 +376,115 @@ policy_table_direct_runtime() {
   [[ -n "$t" ]] && printf '%s' "$t" || printf '%s' "$POLICY_TABLE_DIRECT"
 }
 
-# Есть ли в автогенных файлах неразвёрнутые токены (ASnnnn / ISO-код)?
-autogen_has_tokens() {
-  local f=""
-  for f in "$AS_EXCLUDES" "$COUNTRY_EXCLUDES"; do
-    [[ -f "$f" ]] && grep -qE '^(AS[0-9]+|[A-Za-z]{2})$' "$f" && return 0
-  done
-  return 1
+# Токены-источники из тела файла (по одному на строку).
+file_tokens() {
+  [[ -f "$1" ]] || return 0
+  grep -E '^(AS[0-9]+|[A-Za-z]{2})$' "$1" || true
+}
+
+# Шапка файла-токенов (AS / страны).
+token_file_header() {
+  cat <<'EOF'
+# SSHTUN: источники автогенных префиксов. Формат: один токен на строку —
+# AS9009 (автономная система) или ISO-код страны (ru, de, us). Комментарии
+# (#) и пустые строки допустимы. Префиксы скачиваются в ~/sshtun/generated/
+# командой 'sshtun refresh' или автоматически при 'up' (при недоступности
+# сети используется последний кэш из generated/).
+# Добавить/убрать: sshtun fetch-as AS9009 | fetch-as --remove AS9009
+#                 sshtun fetch-country ru | fetch-country --remove ru
+EOF
+}
+
+# Перезаписать файл-токенов: свежая шапка + пользовательские комментарии
+# + токены (отсортированные, уникальные). Старые управляемые шапки
+# автоген-формата и инлайн-префиксы (legacy) выбрасываются. Если токенов
+# не осталось и пользовательского содержимого тоже нет — файл удаляется.
+write_token_file() { # file token...
+  local file="$1"; shift
+  local kept="" user_lines=""
+  if [[ -f "$file" ]]; then
+    kept="$(grep -vE '^# (SSHTUN:|командами:|Дописывать можно|они развернутся|Источники:|Данные:|Обновлено:|sshtun-managed-sources:)' "$file" \
+      | grep -vE '^(AS[0-9]+|[A-Za-z]{2})$' \
+      | grep -vE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$' || true)"
+    user_lines="$(grep -vE '^[[:space:]]*(#|$)' <<<"$kept" || true)"
+  fi
+  if [[ $# -eq 0 && -z "$user_lines" ]]; then
+    rm -f "$file"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp "$file.XXXXXX")" || die "mktemp failed"
+  {
+    token_file_header
+    [[ -n "$kept" ]] && printf '%s\n' "$kept"
+    if [[ $# -gt 0 ]]; then
+      printf '%s\n' "$@" | sort -u
+    fi
+  } > "$tmp"
+  mv -f "$tmp" "$file"
+  restore_owner "$file"
+}
+
+# Legacy-миграция офлайн: в старом формате префиксы лежали инлайн в файле-токенов.
+# Если generated-кэш ещё не создан — переносим инлайн-префиксы туда (без сети).
+migrate_legacy_inline() { # src_token_file dst_generated
+  local src="$1" dst="$2"
+  [[ -f "$src" && ! -f "$dst" ]] || return 0
+  local prefixes=""
+  prefixes="$(list_entries "$src")" || prefixes=""
+  [[ -n "$prefixes" ]] || return 0
+  mkdir -p "$GENERATED_DIR"
+  {
+    echo "# SSHTUN: АВТОГЕНЕРАЦИЯ (мигрировано из старого формата офлайн; данные"
+    echo "# могут быть устаревшими — выполните 'sshtun refresh' при появлении сети)."
+    echo "# Источники: $(file_sources "$src")"
+    echo "# Обновлено: $(date -Is) (offline-migration)"
+    printf '%s\n' "$prefixes"
+  } > "$dst"
+  restore_owner "$dst"
+  log "Офлайн-миграция префиксов в $dst: $(printf '%s\n' "$prefixes" | grep -c .)"
+}
+
+# Подготовить generated/-кэш перед стартом туннеля.
+# Источники ищутся и в теле (токены), и в legacy-шапке (sshtun-managed-sources)
+# — старые файлы с инлайн-префиксами так перекачиваются при первом же 'up'.
+# Токены есть: refresh (при неудаче — fallback на кэш, иначе legacy-миграция,
+# иначе die). Источников нет: подхватим legacy-инлайн, если файл старого формата.
+ensure_autogen() {
+  local need=0
+  if file_sources "$AS_EXCLUDES" | grep -q .; then need=1; fi
+  if file_sources "$COUNTRY_EXCLUDES" | grep -q .; then need=1; fi
+  if (( need == 0 )); then
+    migrate_legacy_inline "$AS_EXCLUDES" "$AS_GENERATED"
+    migrate_legacy_inline "$COUNTRY_EXCLUDES" "$COUNTRY_GENERATED"
+    return 0
+  fi
+  if refresh_lists; then
+    return 0
+  fi
+  log "WARNING: префиксы AS/стран не обновились (сеть недоступна?)"
+  if [[ -f "$AS_GENERATED" || -f "$COUNTRY_GENERATED" ]]; then
+    log "Использую кэш: $GENERATED_DIR"
+    return 0
+  fi
+  migrate_legacy_inline "$AS_EXCLUDES" "$AS_GENERATED"
+  migrate_legacy_inline "$COUNTRY_EXCLUDES" "$COUNTRY_GENERATED"
+  if [[ -f "$AS_GENERATED" || -f "$COUNTRY_GENERATED" ]]; then
+    log "Данные префиксов могут быть устаревшими — обновите: sshtun refresh"
+    return 0
+  fi
+  die "Префиксы AS/стран недоступны: нет сети и нет кэша в $GENERATED_DIR"
 }
 
 start_vpn() {
+  local foreground=0
+  [[ "${1:-}" == "--foreground" ]] && foreground=1
   check_client
   check_excludes
   check_key
-  # Токены, дописанные в автогенные файлы вручную, разворачиваем перед стартом.
-  if autogen_has_tokens; then
-    log "В автогенных файлах есть неразвёрнутые AS/коды стран — выполняю refresh"
-    refresh_lists || die "refresh не удался — исправьте файлы или сеть и повторите"
-  fi
+  # Токены AS/стран разворачиваем в префиксы (generated/) перед стартом.
+  # Нет сети — используем кэш, если он есть (иначе мигрируем legacy инлайн).
+  ensure_autogen
   log "Поднимаю туннель: $SSH_USER@$SERVER_HOST:$SERVER_PORT (пул tun$TUN_START..tun$TUN_END)"
   local args=(
     --host "$SERVER_HOST"
@@ -379,15 +497,47 @@ start_vpn() {
     --exclude-file "$BASE_EXCLUDES"
     --exclude-file "$CUSTOM_EXCLUDES"
   )
-  [[ -f "$AS_EXCLUDES" ]] && args+=(--exclude-file "$AS_EXCLUDES")
-  [[ -f "$COUNTRY_EXCLUDES" ]] && args+=(--exclude-file "$COUNTRY_EXCLUDES")
+  [[ -f "$AS_GENERATED" ]] && args+=(--exclude-file "$AS_GENERATED")
+  [[ -f "$COUNTRY_GENERATED" ]] && args+=(--exclude-file "$COUNTRY_GENERATED")
   [[ -f "$FORCE_INCLUDES" ]] && args+=(--route-file "$FORCE_INCLUDES")
+  if (( foreground )); then
+    # exec: процесс обёртки СТАНОВИТСЯ sudo -> клиент = main PID службы.
+    # systemd при stop ждёт main: супервизор успевает дочистить маршруты,
+    # а не получает SIGKILL посреди cleanup (было: t201 чист, t200 — нет).
+    # Падение любого звена всё равно видно systemd как смерть main -> рестарт
+    # (Restart=always), ручной down идёт через 'systemctl stop' (маркер
+    # SUPERVISED=1 в state).
+    args+=(--foreground)
+    exec sudo bash "$CLIENT_SCRIPT" start "${args[@]}"
+  fi
   sudo bash "$CLIENT_SCRIPT" start "${args[@]}"
+}
+
+# Маркер SUPERVISED из state работающего туннеля ("1" — под досмотром systemd).
+supervised_marker() {
+  sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${SUPERVISED:-0}"' 2>/dev/null || true
 }
 
 stop_vpn() {
   check_client
+  # Туннель под досмотром systemd (маркер SUPERVISED=1 в state): останавливаем
+  # ЧЕРЕЗ systemctl — иначе Restart=always перезапустил бы его после down.
+  if [[ "$(supervised_marker)" == "1" ]]; then
+    log "Туннель под досмотром systemd — останавливаю службу: systemctl stop sshtun"
+    sudo -n systemctl stop sshtun
+    return
+  fi
   sudo bash "$CLIENT_SCRIPT" stop
+}
+
+restart_vpn() {
+  if [[ "$(supervised_marker)" == "1" ]]; then
+    log "Туннель под досмотром systemd — перезапускаю службу: systemctl restart sshtun"
+    sudo -n systemctl restart sshtun
+    return
+  fi
+  stop_vpn || true
+  start_vpn "$@"
 }
 
 add_excludes() {
@@ -590,19 +740,20 @@ subtract_sources() {
   done
 }
 
-# Перезаписать автогенный файл: шапка + отсортированные уникальные префиксы.
-# $1 — файл, $2 — читаемый список источников (через пробел), $3 — источник данных,
+# Перезаписать автогенный generated-файл: шапка + отсортированные уникальные
+# префиксы. $1 — файл, $2 — читаемый список источников (через пробел), $3 — источник данных,
 # stdin — префиксы. Старое содержимое сохраняется во временный файл и печатается
 # в stdout-потоке как OLD_ENTRIES_FILE=... для последующего diff.
 write_managed_file() {
   local file="$1" sources="$2" datasource="$3"
   local tmp
   tmp="$(mktemp)" || die "mktemp failed"
+  mkdir -p "$(dirname "$file")"
+  restore_owner "$(dirname "$file")"
   {
     echo "# SSHTUN: АВТОГЕНЕРАЦИЯ. Не править префиксы вручную — файл перезаписывается"
     echo "# командами: fetch-as / fetch-country / refresh (в т.ч. автоматически при up)."
-    echo "# Дописывать можно токены-источники: AS9009 (AS) или ru/de/us (страны, ISO) —"
-    echo "# они развернутся в префиксы при следующем refresh."
+    echo "# Источники-ТОКЕНЫ лежат отдельно (~/sshtun/excludes-as.txt, excludes-country.txt)."
     echo "# Источники: $sources"
     echo "# Данные: $datasource"
     echo "# Обновлено: $(date -Is)"
@@ -613,6 +764,7 @@ write_managed_file() {
   old="$(mktemp)" || die "mktemp failed"
   list_entries "$file" > "$old" 2>/dev/null || true
   mv -f "$tmp" "$file"
+  restore_owner "$file"
   printf '%s' "$old"
 }
 
@@ -647,14 +799,17 @@ fetch_as() {
     mapfile -t src_array < <(merge_sources "$AS_EXCLUDES" "${asns[@]}")
   fi
 
+  # Файл-токенов перезаписываем всегда (только токены); префиксы — в generated/.
+  write_token_file "$AS_EXCLUDES" "${src_array[@]}"
+
   if ((${#src_array[@]} == 0)); then
-    # Источников не осталось: файл удаляем, маршруты снимаются через diff.
+    # Источников не осталось: generated-файл удаляем, маршруты снимаются через diff.
     local old
     old="$(mktemp)"
-    list_entries "$AS_EXCLUDES" > "$old" 2>/dev/null || true
-    if [[ -f "$AS_EXCLUDES" ]]; then
-      rm -f "$AS_EXCLUDES"
-      log "Источников не осталось — файл удалён: $AS_EXCLUDES"
+    list_entries "$AS_GENERATED" > "$old" 2>/dev/null || true
+    if [[ -f "$AS_GENERATED" ]]; then
+      rm -f "$AS_GENERATED"
+      log "Источников не осталось — generated-файл удалён: $AS_GENERATED"
     else
       log "Источников не осталось — файла и не было"
     fi
@@ -675,9 +830,9 @@ fetch_as() {
   : > "$combined_file"
   for asn in "${src_array[@]}"; do
     if [[ $use_irr -eq 1 ]]; then
-      prefixes="$(irr_prefixes "$asn")" || die "bgpq4 не ответил для $asn"
+      prefixes="$(irr_prefixes "$asn")" || { log "ERROR: bgpq4 не ответил для $asn"; rm -f "$combined_file"; return 1; }
     else
-      prefixes="$(ripestat_prefixes "$asn")" || die "RIPEstat не ответил для $asn (повторите или используйте --irr)"
+      prefixes="$(ripestat_prefixes "$asn")" || { log "ERROR: RIPEstat не ответил для $asn (повторите или используйте --irr)"; rm -f "$combined_file"; return 1; }
     fi
     printf '%s\n' "$prefixes" >> "$combined_file"
     log "$asn: $(printf '%s\n' "$prefixes" | grep -c .) префиксов"
@@ -686,13 +841,13 @@ fetch_as() {
   local datasource="RIPEstat (фактически анонсируемые префиксы)"
   [[ $use_irr -eq 1 ]] && datasource="bgpq4 / IRR (может содержать устаревшие записи)"
   local old
-  old="$(write_managed_file "$AS_EXCLUDES" "$sources" "$datasource" < "$combined_file")"
+  old="$(write_managed_file "$AS_GENERATED" "$sources" "$datasource" < "$combined_file")"
   rm -f "$combined_file"
 
   local new
   new="$(mktemp)"
-  list_entries "$AS_EXCLUDES" > "$new"
-  log "Записано в $AS_EXCLUDES: $(grep -c . "$new" || true) префиксов"
+  list_entries "$AS_GENERATED" > "$new"
+  log "Записано в $AS_GENERATED: $(grep -c . "$new" || true) префиксов"
   diff_entries "$old" "$new" | apply_direct_changes
   rm -f "$old" "$new"
 }
@@ -723,13 +878,16 @@ fetch_country() {
     mapfile -t src_array < <(merge_sources "$COUNTRY_EXCLUDES" "${ccs[@]}")
   fi
 
+  # Файл-токенов перезаписываем всегда (только токены); префиксы — в generated/.
+  write_token_file "$COUNTRY_EXCLUDES" "${src_array[@]}"
+
   if ((${#src_array[@]} == 0)); then
     local old
     old="$(mktemp)"
-    list_entries "$COUNTRY_EXCLUDES" > "$old" 2>/dev/null || true
-    if [[ -f "$COUNTRY_EXCLUDES" ]]; then
-      rm -f "$COUNTRY_EXCLUDES"
-      log "Источников не осталось — файл удалён: $COUNTRY_EXCLUDES"
+    list_entries "$COUNTRY_GENERATED" > "$old" 2>/dev/null || true
+    if [[ -f "$COUNTRY_GENERATED" ]]; then
+      rm -f "$COUNTRY_GENERATED"
+      log "Источников не осталось — generated-файл удалён: $COUNTRY_GENERATED"
     else
       log "Источников не осталось — файла и не было"
     fi
@@ -748,26 +906,26 @@ fetch_country() {
   combined_file="$(mktemp)" || die "mktemp failed"
   : > "$combined_file"
   for cc in "${src_array[@]}"; do
-    prefixes="$(ipdeny_prefixes "$cc")" || die "ipdeny.com не ответил для $cc"
+    prefixes="$(ipdeny_prefixes "$cc")" || { log "ERROR: ipdeny.com не ответил для $cc"; rm -f "$combined_file"; return 1; }
     printf '%s\n' "$prefixes" >> "$combined_file"
     log "$cc: $(printf '%s\n' "$prefixes" | grep -c .) префиксов"
   done
 
   local old
-  old="$(write_managed_file "$COUNTRY_EXCLUDES" "$sources" "ipdeny.com country zones" < "$combined_file")"
+  old="$(write_managed_file "$COUNTRY_GENERATED" "$sources" "ipdeny.com country zones" < "$combined_file")"
   rm -f "$combined_file"
 
   local new
   new="$(mktemp)"
-  list_entries "$COUNTRY_EXCLUDES" > "$new"
-  log "Записано в $COUNTRY_EXCLUDES: $(grep -c . "$new" || true) префиксов"
+  list_entries "$COUNTRY_GENERATED" > "$new"
+  log "Записано в $COUNTRY_GENERATED: $(grep -c . "$new" || true) префиксов"
   diff_entries "$old" "$new" | apply_direct_changes
   rm -f "$old" "$new"
 }
 
 refresh_lists() {
   log "Обновляю автогенные списки"
-  # Источники берутся из обоих автогенных файлов (шапка + токены в теле)
+  # Источники берутся из файлов-токенов (шапка legacy + токены в теле)
   # и распределяются по форме: ASnnnn -> fetch_as, иначе -> fetch_country.
   local all_sources="" as_sources="" cc_sources="" tok=""
   all_sources="$(file_sources "$AS_EXCLUDES") $(file_sources "$COUNTRY_EXCLUDES")"
@@ -785,21 +943,23 @@ refresh_lists() {
     fi
   done
 
+  local rc=0
   if [[ -n "$as_sources" ]]; then
     local -a arr=()
     IFS=' ' read -r -a arr <<<"$as_sources"
     log "AS-список обновится из RIPEstat (исходный источник данных не запоминается)"
-    fetch_as "${arr[@]}"
+    fetch_as "${arr[@]}" || rc=1
   else
     log "Нет автогенного AS-списка — пропускаю"
   fi
   if [[ -n "$cc_sources" ]]; then
     local -a arr=()
     IFS=' ' read -r -a arr <<<"$cc_sources"
-    fetch_country "${arr[@]}"
+    fetch_country "${arr[@]}" || rc=1
   else
     log "Нет автогенного country-списка — пропускаю"
   fi
+  return "$rc"
 }
 
 # Сырые содержательные строки файла (без чистых комментариев и пустых) —
@@ -827,35 +987,43 @@ list_policy() {
   echo
   echo "=== EXCLUDE (напрямую, мимо туннеля):"
   echo "    свои сети:  sshtun exclude add CIDR...   (или строки CIDR в excludes-custom.txt)"
-  echo "    целые AS:   sshtun fetch-as AS9009       (или токен AS9009 в файле 'автоген AS')"
-  echo "    страны:     sshtun fetch-country ru      (или токен ru в файле 'автоген страны')"
+  echo "    целые AS:   sshtun fetch-as AS9009       (или токен AS9009 в excludes-as.txt)"
+  echo "    страны:     sshtun fetch-country ru      (или токен ru в excludes-country.txt)"
+  echo "    префиксы AS/стран скачиваются в $GENERATED_DIR/"
   echo
   for f in "$BASE_EXCLUDES" "$CUSTOM_EXCLUDES" "$AS_EXCLUDES" "$COUNTRY_EXCLUDES"; do
     case "$f" in
       "$BASE_EXCLUDES") title="базовые" ;;
       "$CUSTOM_EXCLUDES") title="пользовательские" ;;
-      "$AS_EXCLUDES") title="автоген AS" ;;
-      "$COUNTRY_EXCLUDES") title="автоген страны" ;;
+      "$AS_EXCLUDES") title="источники AS" ;;
+      "$COUNTRY_EXCLUDES") title="источники стран" ;;
     esac
     if [[ -f "$f" ]]; then
       n="$(list_entries "$f" | grep -c . || true)"
-      t="$(grep -cE '^(AS[0-9]+|[A-Za-z]{2})$' "$f" || true)"
-      printf '    %-18s %6s префиксов  %s\n' "$title" "$n" "$f"
+      t="$(file_tokens "$f" | grep -c . || true)"
+      printf '    %-18s %6s токен(ов)   %s\n' "$title" "$t" "$f"
       if (( t > 0 )); then
-        printf '    %-18s %6s токен(ов) — развернуть: sshtun refresh (или up/restart)\n' "" "$t"
+        file_tokens "$f" | sed 's/^/      /'
       fi
-      if (( n > 0 && n <= 50 )); then
+      if [[ "$f" == "$AS_EXCLUDES" || "$f" == "$COUNTRY_EXCLUDES" ]] && (( n > 0 )); then
+        printf '    %-18s %6s префиксов (legacy-инлайн, ещё не мигрировано)\n' "" "$n"
+      elif (( n > 0 && n <= 50 )); then
         show_raw_entries "$f" | sed 's/^/      /'
       fi
     else
-      case "$f" in
-        "$AS_EXCLUDES")
-          printf '    %-18s %6s            %s\n' "$title" "—" "$f (создаётся: fetch-as или токен AS в файле)" ;;
-        "$COUNTRY_EXCLUDES")
-          printf '    %-18s %6s            %s\n' "$title" "—" "$f (создаётся: fetch-country или токен ru в файле)" ;;
-        *)
-          printf '    %-18s %6s            %s\n' "$title" "—" "$f (нет файла)" ;;
-      esac
+      printf '    %-18s %6s            %s\n' "$title" "—" "$f (нет файла)"
+    fi
+  done
+  for f in "$AS_GENERATED" "$COUNTRY_GENERATED"; do
+    case "$f" in
+      "$AS_GENERATED") title="автоген AS" ;;
+      "$COUNTRY_GENERATED") title="автоген страны" ;;
+    esac
+    if [[ -f "$f" ]]; then
+      n="$(list_entries "$f" | grep -c . || true)"
+      printf '    %-18s %6s префиксов  %s\n' "$title" "$n" "$f"
+    else
+      printf '    %-18s %6s            %s\n' "$title" "—" "$f (создаётся: fetch/refresh/up)"
     fi
   done
   echo
@@ -870,7 +1038,7 @@ cmd="${1:-}"
 case "$cmd" in
   up|start)        shift; start_vpn "$@" ;;
   down|stop)       shift; stop_vpn "$@" ;;
-  restart)         shift; stop_vpn || true; start_vpn "$@" ;;
+  restart)         shift; restart_vpn "$@" ;;
   status)          shift; check_client; sudo bash "$CLIENT_SCRIPT" status "$@" ;;
   doctor)          shift; check_client; sudo bash "$CLIENT_SCRIPT" doctor "$@" ;;
   cleanup)         shift; check_client; sudo bash "$CLIENT_SCRIPT" cleanup "$@" ;;
