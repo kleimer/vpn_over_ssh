@@ -12,13 +12,19 @@
 #   - ставит systemd-юнит /etc/systemd/system/sshtun.service (ВЫКЛЮЧЕННЫЙ):
 #     управление — systemctl start/stop/status sshtun, автостарт при загрузке —
 #     systemctl enable sshtun. Требование: ключ без passphrase.
+#   - опционально (env TCP_CONGESTION_CONTROL=bbr|cubic): выбирает алгоритм
+#     управления конгестией TCP этой машины. По умолчанию систему НЕ трогает.
+#     BBR снимает RTO-спайки SSH-туннеля на шумных путях, но это sender-side
+#     алгоритм: эффект полный только при включении на ОБОИХ концах.
+#     Действует на новые TCP-соединения — после install переподнимите туннель.
 #
 # Данные (~/sshtun, ключи) установка не затирает.
 #
 # Команды:
 #   install            установить (или обновить установленную копию)
 #   update             git pull в репозитории + install
-#   uninstall          убрать symlink, INSTALL_DIR и systemd-юнит (данные ~/sshtun остаются)
+#   uninstall          убрать symlink, INSTALL_DIR, systemd-юнит и sysctl-файл
+#                      congestion control (данные ~/sshtun остаются)
 #   uninstall --purge  то же + удалить ~/sshtun вызывающего пользователя
 #   reinstall          uninstall + install
 #
@@ -37,6 +43,52 @@ REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)
 
 log(){ echo "[install] $*"; }
 die(){ echo "[install][ERROR] $*" >&2; exit 1; }
+
+CC_SYSCTL_FILE="/etc/sysctl.d/90-vpn-over-ssh-congestion.conf"
+CC_MODULE_FILE="/etc/modules-load.d/vpn-over-ssh-tcp_bbr.conf"
+
+# Опциональный выбор алгоритма управления конгестией TCP (BBR/CUBIC/...).
+# По умолчанию (env не задан/none) систему не трогаем. bbr дополнительно
+# грузит модуль tcp_bbr и добавляет его в автозагрузку. Применяется сразу,
+# действует на НОВЫЕ TCP-соединения — туннель переподнять (sshtun restart).
+# Откат: TCP_CONGESTION_CONTROL=cubic + повторный install, либо uninstall.
+setup_congestion_control() {
+  local cc="${TCP_CONGESTION_CONTROL:-}"
+  [[ -z "$cc" || "$cc" == "none" ]] && { log "TCP_CONGESTION_CONTROL не задан — системный алгоритм не трогаем"; return 0; }
+  cc="$(tr 'A-Z' 'a-z' <<<"$cc")"
+
+  if [[ "$cc" == "bbr" ]]; then
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx bbr; then
+      sudo -n modprobe tcp_bbr 2>/dev/null || die "Модуль tcp_bbr недоступен (ядро без BBR?). Отказ: системный алгоритм не изменён."
+    fi
+    echo "tcp_bbr" | sudo -n tee "$CC_MODULE_FILE" >/dev/null
+    log "Модуль tcp_bbr загружен и добавлен в автозагрузку: $CC_MODULE_FILE"
+  else
+    sudo -n rm -f "$CC_MODULE_FILE"
+  fi
+
+  sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx "$cc" \
+    || die "Алгоритм '$cc' недоступен в ядре (доступны: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null))"
+
+  printf '# vpn_over_ssh: выбранный алгоритм управления конгестией TCP\n# (установлено install_client.sh; удалите файл для отката к системному дефолту)\nnet.ipv4.tcp_congestion_control=%s\n' "$cc" | sudo -n tee "$CC_SYSCTL_FILE" >/dev/null
+  sudo -n sysctl -p "$CC_SYSCTL_FILE" >/dev/null
+  log "net.ipv4.tcp_congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control) (файл: $CC_SYSCTL_FILE)"
+}
+
+# Удаляем только то, что ставили мы; если текущий алгоритм совпадает
+# с нашим файлом — возвращаем cubic (ядро всегда умеет).
+remove_congestion_control() {
+  [[ -f "$CC_SYSCTL_FILE" ]] || return 0
+  local ours="" current=""
+  ours="$(awk -F= '/^net.ipv4.tcp_congestion_control=/{print $2}' "$CC_SYSCTL_FILE" | tail -n1)"
+  current="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  rm -f "$CC_SYSCTL_FILE" "$CC_MODULE_FILE"
+  log "Удалены: $CC_SYSCTL_FILE, $CC_MODULE_FILE"
+  if [[ -n "$ours" && "$current" == "$ours" && "$ours" != "cubic" ]]; then
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    log "Алгоритм возвращён на cubic (новые соединения)"
+  fi
+}
 
 ensure_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -140,6 +192,7 @@ cmd_install() {
 
   seed_user_files
   install_service_unit
+  setup_congestion_control
 
   echo
   log "Готово. Команды:"
@@ -176,6 +229,7 @@ cmd_uninstall() {
   rm -rf "$INSTALL_DIR"
   log "Удалён каталог: $INSTALL_DIR"
   remove_service_unit
+  remove_congestion_control
 
   if (( purge )); then
     local u="" home=""
