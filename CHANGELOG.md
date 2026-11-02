@@ -11,16 +11,25 @@
   оставался сиротой — после сна/падения сети туннель умирал до ручного
   вмешательства. Теперь:
   - клиент умеет `--foreground`: после старта досматривает ssh-процесс;
-    неожиданная смерть ssh -> cleanup + exit 1, штатный stop/down -> exit 0;
-  - `install_client.sh` ставит выключенный юнит
-    `/etc/systemd/system/sshtun.service` (`Restart=on-failure`,
-    `RestartSec=5`, `network-online.target`), автостарт — по желанию:
-    `systemctl enable sshtun`;
-  - различение «падения» и «штатной остановки»: `sshtun down` удаляет state,
-    супервизор видит это и выходит с кодом 0 (без рестарта);
-  - блокировка (flock) отпускается перед входом в supervise — иначе `down`
-    никогда бы не получил лок.
-  Причина: туннель должен переживать сон ноутбука и рестартовать сам.
+    неожиданная смерть ssh -> cleanup + exit 1, штатный stop -> exit 0;
+  - обёртка в foreground-режиме делает `exec sudo` — main PID службы это
+    sudo->клиент, поэтому systemd при `systemctl stop` ЖДЁТ, пока супервизор
+    дочистит маршруты (без exec main-процесс умирал первым и systemd
+    добивал остальных SIGKILL посреди cleanup — оставались таблица 200
+    и правило 25100);
+  - юнит `Restart=always` (внешний kill ЛЮБОГО звена цепочки — sudo relay'ит
+  SIGTERM — раньше выглядел как штатный стоп без рестарта); явный
+    `systemctl stop` systemd чтит и не перезапускает;
+  - ручной `sshtun down`/`restart` при supervised-туннеле видит маркер
+    `SUPERVISED=1` в state и идёт через `systemctl stop/restart` —
+    иначе Restart=always перезапустил бы туннель;
+  - grace-период 5 с закрывает гонку с внешним `stop_vpn` (state удаляется
+    после cleanup, а не до);
+  - блокировка (flock) отпускается перед supervise — иначе `down` никогда
+    бы не получил лок.
+  `install_client.sh` ставит выключенный юнит `/etc/systemd/system/sshtun.service`
+  (`RestartSec=5`, `network-online.target`), автостарт — `systemctl enable sshtun`.
+  Причина: туннель должен переживать сон ноутбука и любые внешние kill.
   Ограничение: для службы ключ без passphrase (SSH BatchMode).
 
 ### Изменено

@@ -60,6 +60,9 @@ TEMP_AGENT_PID=""
 REMOTE_SETUP="${REMOTE_SETUP:-auto}"
 REMOTE_WAN_DEV="${REMOTE_WAN_DEV:-}"
 # --foreground: держать процесс в живых после старта и досматривать ssh.
+# Маркер пишется в state: обёртка по нему понимает, что туннель под досмотром
+# systemd, и останавливает через 'systemctl stop' (иначе Restart=always
+# перезапустил бы туннель после ручного 'sshtun down').
 FOREGROUND="${FOREGROUND:-0}"
 
 # Safety guard for cleanup: delete only tunNNN with N>=100 and IP from 10.250.0.0/16.
@@ -100,8 +103,10 @@ POLICY_TABLE_TUN="${POLICY_TABLE_TUN:-201}"
 RULE_PREF_DIRECT="${RULE_PREF_DIRECT:-25100}"
 RULE_PREF_TUN="${RULE_PREF_TUN:-25110}"
 
-log(){ echo "[$(date -Is)] $*"; }
-die(){ echo "[ERROR] $*" >&2; exit 1; }
+# После остановки юнита stdout может быть уже закрыт (SIGPIPE в date/echo) —
+# лог не должен ронять скрипт посреди cleanup.
+log(){ echo "[$(date -Is)] $*" 2>/dev/null || true; }
+die(){ echo "[ERROR] $*" >&2 || true; exit 1; }
 
 usage() {
   cat <<EOFUSAGE
@@ -426,6 +431,7 @@ write_state() {
     # обязан дочищать per-prefix маршруты из main, новым это не нужно
     # (их маршруты в политических таблицах, снимаются flush'ем).
     printf 'POLICY_ROUTES=%q\n' "1"
+    printf 'SUPERVISED=%q\n' "$FOREGROUND"
     printf 'TUN_NET_A=%q\n' "$TUN_NET_A"
     printf 'TUN_NET_B=%q\n' "$TUN_NET_B"
     printf 'TUN_PREFIX=%q\n' "$TUN_PREFIX"
@@ -1033,6 +1039,7 @@ supervise_vpn() {
   fi
 
   log "ssh process died unexpectedly — cleaning up and exiting with failure"
+  set +e
   cleanup_routes "${TUN_DEV:-}" "${SERVER_REAL_IP:-}" "$HAD_IPV6_BLACKHOLE"
   [[ -n "${TUN_DEV:-}" ]] && ip link del "$TUN_DEV" 2>/dev/null || true
   preserve_ssh_log
@@ -1041,6 +1048,7 @@ supervise_vpn() {
 }
 
 supervisor_on_signal() {
+  set +e
   trap - TERM INT EXIT ERR
   log "Stop signal received — shutting down tunnel"
   kill_pid_safe "${SSH_PID:-}"

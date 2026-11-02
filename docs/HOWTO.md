@@ -220,13 +220,20 @@ systemctl status sshtun             # снова active; N restarts в стат�
 sshtun status                       # туннель поднялся, маршруты на месте
 ```
 
-Остановки БЕЗ рестарта (проверить каждую):
+> Убивайте именно ssh-процесс (SSH_PID из state) — команда выше делает это
+> сама. Цепочка процессов службы: `wrapper -> sudo -> клиент -> ssh`.
+> Случайный kill по sudo/wrapper тоже безопасен (служба перезапустится),
+> но тест «падения» должен бить по ssh.
+
+Остановки БЕЗ рестарта (проверить каждую) — при `Restart=always` это
+работает через явный stop по systemd:
 
 ```bash
 sudo systemctl stop sshtun         # штатно, остаётся inactive
 sudo systemctl start sshtun
-sshtun down                        # штатно: служба видит ручную остановку и НЕ рестартит
+sshtun down                        # обёртка сама пойдёт через systemctl stop
 systemctl is-active sshtun         # inactive (dead) — без рестарта
+sshtun restart                     # при службе: systemctl restart sshtun
 ```
 
 Автостарт при загрузке (опционально, требуется ключ без passphrase):

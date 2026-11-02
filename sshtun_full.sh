@@ -89,8 +89,8 @@ COUNTRY_GENERATED="$GENERATED_DIR/excludes-country.txt"
 # Таблицы policy routing — должны совпадать с клиентом (он пишет их в state).
 POLICY_TABLE_DIRECT="${POLICY_TABLE_DIRECT:-200}"
 
-log(){ echo "[$(date -Is)] $*"; }
-die(){ echo "[ERROR] $*" >&2; exit 1; }
+log(){ echo "[$(date -Is)] $*" 2>/dev/null || true; }
+die(){ echo "[ERROR] $*" >&2 || true; exit 1; }
 
 # Под systemd обёртка работает от root, а файлы данных должен править
 # пользователь — возвращаем владельцу ~/sshtun и читаемые права (работает
@@ -500,13 +500,44 @@ start_vpn() {
   [[ -f "$AS_GENERATED" ]] && args+=(--exclude-file "$AS_GENERATED")
   [[ -f "$COUNTRY_GENERATED" ]] && args+=(--exclude-file "$COUNTRY_GENERATED")
   [[ -f "$FORCE_INCLUDES" ]] && args+=(--route-file "$FORCE_INCLUDES")
-  (( foreground )) && args+=(--foreground)
+  if (( foreground )); then
+    # exec: процесс обёртки СТАНОВИТСЯ sudo -> клиент = main PID службы.
+    # systemd при stop ждёт main: супервизор успевает дочистить маршруты,
+    # а не получает SIGKILL посреди cleanup (было: t201 чист, t200 — нет).
+    # Падение любого звена всё равно видно systemd как смерть main -> рестарт
+    # (Restart=always), ручной down идёт через 'systemctl stop' (маркер
+    # SUPERVISED=1 в state).
+    args+=(--foreground)
+    exec sudo bash "$CLIENT_SCRIPT" start "${args[@]}"
+  fi
   sudo bash "$CLIENT_SCRIPT" start "${args[@]}"
+}
+
+# Маркер SUPERVISED из state работающего туннеля ("1" — под досмотром systemd).
+supervised_marker() {
+  sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${SUPERVISED:-0}"' 2>/dev/null || true
 }
 
 stop_vpn() {
   check_client
+  # Туннель под досмотром systemd (маркер SUPERVISED=1 в state): останавливаем
+  # ЧЕРЕЗ systemctl — иначе Restart=always перезапустил бы его после down.
+  if [[ "$(supervised_marker)" == "1" ]]; then
+    log "Туннель под досмотром systemd — останавливаю службу: systemctl stop sshtun"
+    sudo -n systemctl stop sshtun
+    return
+  fi
   sudo bash "$CLIENT_SCRIPT" stop
+}
+
+restart_vpn() {
+  if [[ "$(supervised_marker)" == "1" ]]; then
+    log "Туннель под досмотром systemd — перезапускаю службу: systemctl restart sshtun"
+    sudo -n systemctl restart sshtun
+    return
+  fi
+  stop_vpn || true
+  start_vpn "$@"
 }
 
 add_excludes() {
@@ -1007,7 +1038,7 @@ cmd="${1:-}"
 case "$cmd" in
   up|start)        shift; start_vpn "$@" ;;
   down|stop)       shift; stop_vpn "$@" ;;
-  restart)         shift; stop_vpn || true; start_vpn "$@" ;;
+  restart)         shift; restart_vpn "$@" ;;
   status)          shift; check_client; sudo bash "$CLIENT_SCRIPT" status "$@" ;;
   doctor)          shift; check_client; sudo bash "$CLIENT_SCRIPT" doctor "$@" ;;
   cleanup)         shift; check_client; sudo bash "$CLIENT_SCRIPT" cleanup "$@" ;;

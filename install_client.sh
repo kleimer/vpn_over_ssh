@@ -86,6 +86,8 @@ install_service_unit() {
 Description=SSH-TUN VPN client (vpn_over_ssh)
 After=network-online.target
 Wants=network-online.target
+# без лимита рестартов: старт дёшев, офлайн при загрузке не должен «сжечь» юнит
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -93,10 +95,12 @@ Type=simple
 Environment=EXCLUDES_DIR=$home/sshtun
 Environment=KEY_FILE=$home/.ssh/sshtun_ed25519
 ExecStart=$BIN_DIR/$LINK_NAME up --foreground
-# Туннель упал (сон/сеть) -> код 1 -> рестарт. Штатный stop/down -> код 0 -> без рестарта.
-Restart=on-failure
+# Restart=always: перезапуск и при чистом выходе — иначе внешний kill любого
+# звена цепочки (sudo relay'ит SIGTERM дальше) выглядел бы как штатный стоп.
+# Явный 'systemctl stop' systemd чтит и НЕ перезапускает. Ручной 'sshtun down'
+# идёт через systemctl stop — обёртка видит маркер SUPERVISED=1 в state.
+Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
