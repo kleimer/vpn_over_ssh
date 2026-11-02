@@ -189,7 +189,13 @@ cmd_install() {
 
   mkdir -p "$INSTALL_DIR"
   for f in "${FILES[@]}"; do
-    install -m 0755 "$REPO_DIR/$f" "$INSTALL_DIR/$f"
+    # Атомарная замена: install сразу в целевой файл обрезает его по месту,
+    # а выполняющийся супервизор читает скрипт инкрементально и получает
+    # битый байт-поток. tmp + mv (rename) — работающий процесс продолжает
+    # старый inode, новые запуски видят новый файл.
+    local tmp_new="$INSTALL_DIR/.$f.new.$$"
+    install -m 0755 "$REPO_DIR/$f" "$tmp_new"
+    mv -f "$tmp_new" "$INSTALL_DIR/$f"
     log "Установлен: $INSTALL_DIR/$f"
   done
 
