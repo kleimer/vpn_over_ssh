@@ -190,6 +190,8 @@ sshtun status             # сам поднялся обратно (KeepAlive)
 ## 5. Чек-лист готовности порта
 
 - [ ] `sshtun up/down/restart/status/doctor` работают на macOS (Intel)
+- [ ] мультисервер: `server add/list/use/del` — работают без изменений (это
+      файловые операции над `~/sshtun/`; переключение переподнимает туннель)
 - [ ] full-tunnel + excludes: `route -n get` на TEST-NET сходится с ожиданиями (4.1–4.2)
 - [ ] DNS: `scutil --dns` показывает 1.1.1.1/8.8.8.8 при работе; после down — восстановлены прежние
 - [ ] fetch/refresh/--remove: токены и `generated/` (4.3), офлайн-fallback

@@ -120,6 +120,8 @@ seed_user_files() {
 
   local dir="$home/sshtun" f=""
   mkdir -p "$dir"
+  install -d -m 0755 -o "$u" "$dir/servers" 2>/dev/null \
+    || { mkdir -p "$dir/servers"; chown "$u" "$dir/servers" 2>/dev/null || true; }
   for f in "${TEMPLATES[@]}"; do
     if [[ ! -f "$dir/$f" ]]; then
       [[ -f "$REPO_DIR/examples/$f" ]] || die "Нет шаблона: $REPO_DIR/examples/$f"
